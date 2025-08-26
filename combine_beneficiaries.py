@@ -7,12 +7,14 @@ import logging
 import os
 import sys
 
-from pilot_area_downstream_pop_and_es_summary import (
+from pilot_indicators_area_downstream_pop_and_es_summary import (
     align_and_resize_raster_stack,
 )
 from people_within_travel_time import transform_edge_points_eckert_to_wgs84
-from pilot_area_downstream_pop_and_es_summary import clean_it
-from pilot_area_downstream_pop_and_es_summary import mask_by_nonzero_and_sum
+from pilot_indicators_area_downstream_pop_and_es_summary import clean_it
+from pilot_indicators_area_downstream_pop_and_es_summary import (
+    mask_by_nonzero_and_sum,
+)
 from ecoshard import geoprocessing
 from ecoshard import taskgraph
 from shapely.geometry import box
