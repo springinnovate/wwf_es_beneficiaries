@@ -1,8 +1,7 @@
 """
 Run with docker container:
-docker build . -t therealspring/wwf_es_beneficiaries_executor:latest && docker run --rm -it -v .:/usr/local/wwf_es_beneficiaries therealspring/wwf_es_beneficiaries_executor:latest
 
-docker run --rm -it -v .:/usr/local/wwf_es_beneficiaries therealspring/wwf_es_beneficiaries_executor:latest
+docker run --rm -it -v .:/usr/local/roadmap2030 therealspring/roadmap2030_executor:latest
 """
 
 import collections
@@ -58,12 +57,10 @@ BUFFER_AMOUNTS_IN_PIXELS_M = [
 ]
 
 # This is relative because Docker will map a volume
-GLOBAL_SUBWATERSHEDS_VECTOR_PATH = "./data/dem_precondition/merged_lev06.shp"
-DEM_RASTER_PATH = "./data/dem_precondition/astgtm_compressed.tif"
+GLOBAL_SUBWATERSHEDS_VECTOR_PATH = "./dem_precondition/merged_lev06.shp"
+DEM_RASTER_PATH = "./dem_precondition/astgtm_compressed.tif"
 
-AOI_DIRS = [
-    "./data/aois/All_amazon_projects"
-]  # "./data/aois/WWF-Int_Pilot-sites", "./data/aois/aoi_by_country"]
+AOI_DIRS = ["./data/WWF-Int_Pilot-sites", "./data/aoi_by_country"]
 
 ANALYSIS_AOIS = {}
 BAD_AOIS = {}
@@ -99,8 +96,8 @@ POPULATION_RASTERS = {
 }
 
 ES_RASTERS = {
-    "sed_export_tnc_ESA_2020-1992_change": "./data/es_change_rasters/sed_export_tnc_ESA_2020-1992_change_md5_0ab0cf.tif",
-    "n_export_tnc_2020-1992_change": "./data/es_change_rasters/n_export_tnc_2020-1992_change_val_md5_18a2b3.tif",
+    "sed_export_tnc_ESA_2020-1992_change": "./data/ABUNCHASERVICES/sed_export_tnc_ESA_2020-1992_change_md5_0ab0cf.tif",
+    "n_export_tnc_2020-1992_change": "./data/ABUNCHASERVICES/n_export_tnc_2020-1992_change_val_md5_18a2b3.tif",
 }
 
 

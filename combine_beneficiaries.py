@@ -39,7 +39,7 @@ logging.getLogger("fiona").setLevel(logging.WARNING)
 
 MASK_DIRS = [
     "workspace_downstream_es_analysis",
-    "workspace_dist_to_hab_with_friction",
+    "workspace_nature_access_analysis",
 ]
 SUFFIXES = {
     "_max_reach_60min.tif",
