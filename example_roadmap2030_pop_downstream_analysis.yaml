@@ -1,0 +1,35 @@
+run_name: example_roadmap2030_pop_downstream_analysis
+work_dir: ./working_dir
+output_dir: ./output_dir
+
+inputs:
+  population_raster: "./Data for analyses/pop_rasters/landscan-global-2023.tif"
+  traveltime_raster: "./Data for analyses/travel_time/friction_surface_2019_compressed_md5_1be7dd230178a5d395529be7a5e3fb0a.tif"
+  subwatershed_vector: "./Data for analyses/dem_precondition/merged_lev06.shp"
+  aoi_vector_pattern:
+    - "./Data for analyses/aois/aoi_by_country/*.gpkg"
+    - "./Data for analyses/aois/WWF_Int_Pilot-sites/*.shp"
+    - "./Data for analyses/aois/WWF_Int_Pilot-sites/*/*.shp"
+
+sections:
+  - masks:
+    - id: a_within_travel_time
+      type: travel_time_population
+      params:
+        max_hours: 2.0
+    - id: n_export_mask
+      type: conditional_raster
+      params:
+        condition_raster: "C:\Users\richp\repositories\wwf_es_beneficiaries\Data for analyses\es_change_rasters\n_export_tnc_2020-1992_change_val_md5_18a2b3.tif"
+        expression: 'value > 0'
+    - id: sed_export_mask
+      type: conditional_raster
+      params:
+        condition_raster: "C:\Users\richp\repositories\wwf_es_beneficiaries\Data for analyses\es_change_rasters\sed_export_tnc_ESA_2020-1992_change_md5_0ab0cf.tif"
+        expression: 'value > 0'
+  - combine:
+    - logic: OR
+
+logging:
+  level: INFO
+  to_file: output.log
