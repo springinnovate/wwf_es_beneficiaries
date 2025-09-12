@@ -32,7 +32,7 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt
 
 ARG CACHEBUST=1
-#ARG ECOSHARD_COMMIT=f9ccf00
+# Wrote this on 2025/9/12, so the ecoshard hash should be from around that time
 RUN git clone https://github.com/springinnovate/ecoshard.git /usr/local/ecoshard && \
     cd /usr/local/ecoshard && \
     #git checkout ${ECOSHARD_COMMIT} && \
