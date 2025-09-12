@@ -7,13 +7,15 @@ docker build -t ds_beneficiaries:latest . && docker run --rm -it -v "%CD%":/usr/
 docker build -t ds_beneficiaries:latest . && docker run --rm -it -v `pwd`:/usr/local/wwf_es_beneficiaries ds_beneficiaries:latest
 """
 
-import argparse
-import json
 from pathlib import Path
-import logging
 from typing import Any, Dict, List, Tuple
+import argparse
+import glob
+import logging
 import sys
 
+from ecoshard import taskgraph
+import psutil
 import yaml
 
 
@@ -273,6 +275,36 @@ def print_yaml_config(config):
     logger.info("  to_file: %s", config["logging"]["to_file"])
 
 
+def collect_aoi_files(config: dict) -> dict[str, Path]:
+    """
+    Collect AOI files from the patterns in config['inputs']['aoi_vector_pattern'].
+
+    Returns:
+        dict mapping file stem -> Path
+
+    Raises:
+        ValueError if two or more files share the same stem.
+    """
+    inputs = config.get("inputs", {})
+    patterns = inputs.get("aoi_vector_pattern", [])
+    if not isinstance(patterns, (list, tuple)):
+        patterns = [patterns]
+
+    aoi_map: dict[str, Path] = {}
+    for pattern in patterns:
+        for p in glob.glob(pattern):
+            path = Path(p).resolve()
+            stem = path.stem
+            if stem in aoi_map:
+                raise ValueError(
+                    f'Duplicate AOI stem "{stem}" found:\n'
+                    f"  - {aoi_map[stem]}\n"
+                    f"  - {path}"
+                )
+            aoi_map[stem] = path
+    return aoi_map
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Extract and normalize analysis config from YAML."
@@ -295,7 +327,13 @@ def main() -> None:
 
     validate_paths(config)
     logger.info(f"{args.config} read successfully")
-    # print_yaml_config(config)
+
+    aoi_id_to_path = collect_aoi_files(config)
+    logger.info(f"found {len(aoi_id_to_path)} aois to process")
+
+    n_workers = min(len(aoi_id_to_path), psutil.cpu_count(logical=False))
+    update_rate = 15.0
+    task_graph = taskgraph.TaskGraph(config["work_dir"], n_workers, update_rate)
 
 
 if __name__ == "__main__":
