@@ -1,56 +1,49 @@
-FROM mambaorg/micromamba:1.4.2-bullseye
+# windows:
+# docker build -t ds_beneficiaries:latest . && docker run --rm -it -v "%CD%":/usr/local/wwf_es_beneficiaries ds_beneficiaries:latest
+# linux/mac:
+# docker build -t ds_beneficiaries:latest . && docker run --rm -it -v `pwd`:/usr/local/wwf_es_beneficiaries ds_beneficiaries:latest
+FROM python:3.11-slim
 
-# We want all RUN commands to use Bash.
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
-# Copy over your environment file
-COPY environment.yml /tmp/environment.yml
-
-# Create the environment
-RUN micromamba create -n hf311 -f /tmp/environment.yml --yes && \
-    micromamba clean --all --yes
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 ARG WORKDIR=/usr/local/wwf_es_beneficiaries
 ENV WORKDIR=${WORKDIR}
 
-RUN micromamba shell init -s bash -p /opt/conda
-
-# If needed, ensure the file exists and append your activation line
-RUN touch /home/mambauser/.bashrc
-RUN echo 'micromamba activate hf311' >> /home/mambauser/.bashrc
-
-USER root
-RUN apt-get update -y
-RUN apt install git -y
-RUN apt-get install -y --no-install-recommends \
-    gcc \
-    g++ \
-    make \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    zlib1g-dev \
-    libpython3-dev \
-    libssl-dev \
-    libffi-dev \
+    git \
+    curl \
+    ca-certificates \
+    gdal-bin \
+    libgdal-dev \
+    proj-bin \
+    libproj-dev \
+    libgeos-dev \
     libsqlite3-dev \
-    libgdal-dev
+    && rm -rf /var/lib/apt/lists/*
 
-RUN usermod -aG sudo mambauser && \
-    echo "mambauser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
-
-RUN apt-get update -y && apt-get install htop gpg curl -y
-
-RUN git clone https://github.com/springinnovate/ecoshard.git /usr/local/ecoshard && \
-    cd /usr/local/ecoshard && \
-    micromamba run -n hf311 pip install . && \
-    git log -1 --format="%h on %ci" > /usr/local/ecoshard.gitversion
-
-COPY ./shortest_distances /usr/local/shortest_distances
-#COPY pyproject.toml /usr/local/shortest_distances/
-
-# Install inside the hf311 env
-ARG CACHEBUST=1
-RUN cd /usr/local/shortest_distances && micromamba run -n hf311 pip install .
+RUN python -m pip install --upgrade pip setuptools wheel
 WORKDIR ${WORKDIR}
 
-USER mambauser
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install -r /tmp/requirements.txt
+
+ARG CACHEBUST=1
+#ARG ECOSHARD_COMMIT=f9ccf00
+RUN git clone https://github.com/springinnovate/ecoshard.git /usr/local/ecoshard && \
+    cd /usr/local/ecoshard && \
+    #git checkout ${ECOSHARD_COMMIT} && \
+    pip install . && \
+    git log -1 --format='%h on %ci' > /usr/local/ecoshard.gitversion
+
+
+COPY ./shortest_distances /usr/local/shortest_distances
+RUN pip install /usr/local/shortest_distances
+
+RUN useradd -ms /bin/bash user && chown -R user:user ${WORKDIR} /usr/local/ecoshard /usr/local/shortest_distances
+USER user
+
 CMD ["/bin/bash"]
