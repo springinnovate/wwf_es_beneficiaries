@@ -28,6 +28,55 @@ def _as_list(x: Any) -> List[Any]:
 
 
 def process_config(config_path: Path) -> Dict[str, Any]:
+    """Parse and validate a YAML file for the beneficiaries workflow.
+
+    This function reads a YAML file, enforces basic correctness checks,
+    normalizes shapes, and returns a dictionary with canonical keys used by the
+    pipeline. It verifies that the YAML's 'run_name' matches the configuration
+    filename stem, that required inputs are present, and that the 'sections'
+    block contains both a
+    'masks' and a 'combine' section with the expected structures.
+
+    Args:
+        config_path (Path): Path to the YAML configuration file. The filename
+            stem must equal the 'run_name' value inside the YAML (e.g., a file
+            named 'my_run.yaml' must contain 'run_name: my_run').
+
+    Returns:
+        Dict[str, Any]: A normalized configuration dictionary with keys:
+            - 'run_name' (str)
+            - 'work_dir' (str)
+            - 'output_dir' (str)
+            - 'inputs' (dict):
+                - 'population_raster_path' (str)
+                - 'traveltime_raster_path' (str)
+                - 'subwatershed_vector_path' (str)
+                - 'aoi_vector_pattern' (list[str])
+            - 'masks' (list[dict]): Each item has 'id' (str), 'type' (str),
+              and 'params' (dict).
+            - 'combine' (list[dict]): As provided in the YAML 'combine'
+               section.
+            - 'logging' (dict): Contains 'level' (str) and 'to_file' (str).
+
+    Raises:
+        ValueError: If any of the following occur:
+            - 'run_name' does not match the configuration filename stem.
+            - The 'inputs' section is missing or empty.
+            - Any required input is missing:
+                'population_raster_path', 'traveltime_raster_path',
+                'subwatershed_vector_path', or 'aoi_vector_pattern'.
+            - Any 'sections' entry is not a mapping (dict).
+            - A 'masks' or 'combine' item within 'sections' is not a dict.
+            - The 'sections' block does not include both a 'masks' and
+              a 'combine' section.
+            - Aggregated structural errors are detected during validation.
+
+    Notes:
+        - The function only reads from disk (the YAML file). It does not touch
+          or validate the existence of referenced data paths here.
+        - 'aoi_vector_pattern' is normalized to a list via a helper
+           like '_as_list'.
+    """
     with config_path.open("r", encoding="utf-8") as f:
         raw_yaml = yaml.safe_load(f) or {}
     run_name = raw_yaml.get("run_name", "")
@@ -276,8 +325,9 @@ def print_yaml_config(config):
 
 
 def collect_aoi_files(config: dict) -> dict[str, Path]:
-    """
-    Collect AOI files from the patterns in config['inputs']['aoi_vector_pattern'].
+    """Collect AOI files from the patterns.
+
+    In config['inputs']['aoi_vector_pattern'].
 
     Returns:
         dict mapping file stem -> Path
@@ -306,6 +356,7 @@ def collect_aoi_files(config: dict) -> dict[str, Path]:
 
 
 def main() -> None:
+    """Entry point."""
     ap = argparse.ArgumentParser(
         description="Extract and normalize analysis config from YAML."
     )
