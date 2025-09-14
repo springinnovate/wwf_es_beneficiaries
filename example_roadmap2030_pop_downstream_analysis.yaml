@@ -31,5 +31,5 @@ sections:
     - logic: OR
 
 logging:
-  level: INFO
+  level: DEBUG
   to_file: output.log

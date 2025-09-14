@@ -31,7 +31,7 @@ RUN apt-get install -y --no-install-recommends \
     libsqlite3-dev \
     libgdal-dev
 
-ARG CACHEBUST=1
+ARG CACHEBUST=3
 
 ARG WORKDIR=/usr/local/wwf_es_beneficiaries
 ENV WORKDIR=${WORKDIR}
