@@ -803,6 +803,7 @@ def apply_travel_time_mask(
     aoi_vector_path: Path,
     max_hours: float,
     target_crs: str,
+    target_pop_raster_path: Path,
     working_dir: Path,
 ):
     """
@@ -903,10 +904,16 @@ def apply_travel_time_mask(
     ) as max_reach:
         max_reach.write(travel_reach_array, 1)
 
-    in_range_pop_count = np.sum(
-        pop_array[(travel_reach_array > 0) & (pop_array > 0)]
+    pop_meta = ref_meta.copy()
+    pop_meta.update(
+        {"count": 1, "dtype": rasterio.int64, "nodata": 0, "compress": "lzw"}
     )
-    return in_range_pop_count
+    pop_masked_array = np.where(
+        (travel_reach_array > 0) & (pop_array > 0), pop_array, 0
+    )
+    with rasterio.open(target_pop_raster_path, "w", **pop_meta) as dst:
+        dst.write(pop_masked_array, 1)
+    return np.sum(pop_masked_array)
 
 
 def main() -> None:
@@ -926,6 +933,8 @@ def main() -> None:
     args = ap.parse_args()
 
     config = process_config(args.config)
+    output_dir = Path(config["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_logger(
         config["logging"]["level"], config["logging"]["to_file"]
     )
@@ -938,9 +947,10 @@ def main() -> None:
 
     n_workers = min(len(aoi_id_to_path), psutil.cpu_count(logical=False))
     update_rate = 15.0
-    logging.basicConfig()
+
     task_graph = taskgraph.TaskGraph(config["work_dir"], n_workers, update_rate)
     logging.getLogger("ecoshard").setLevel(config["logging"]["level"])
+    logging.basicConfig()
 
     # these drive how we cut, reproject, and determine distance
     wgs84_pixel_size = config["inputs"]["wgs84_pixel_size"]
@@ -959,6 +969,7 @@ def main() -> None:
         )
         good_crs_for_aoi[aoi_key] = crs_task
 
+    section_mask_ids = set()
     for aoi_key, aoi_vector_path in aoi_id_to_path.items():
         working_dir = Path(config["work_dir"]) / Path(aoi_key)
         working_dir.mkdir(parents=True, exist_ok=True)
@@ -1018,19 +1029,30 @@ def main() -> None:
             task_name=f"calculate flow dir for {aoi_key}",
         )
 
-        logger.info(good_crs_for_aoi[aoi_key].get())
         for mask_section in config["masks"]:
+            section_mask_ids.add(mask_section["id"])
             # target_mask_path = working_dir / f'{mask_section["id"]}_mask.tif'
+
             if mask_section["type"] == "travel_time_population":
-                # TODO: apply travel time function to
-                apply_travel_time_mask(
-                    config["inputs"]["traveltime_raster_path"],
-                    config["inputs"]["population_raster_path"],
-                    aoi_vector_path,
-                    mask_section["params"]["max_hours"],
-                    good_crs_for_aoi[aoi_key].get().crs,
-                    working_dir,
+                target_pop_raster_path = (
+                    output_dir / f"{aoi_key}_{mask_section['id']}.tif"
                 )
+                task_graph.add_task(
+                    func=apply_travel_time_mask,
+                    args=(
+                        config["inputs"]["traveltime_raster_path"],
+                        config["inputs"]["population_raster_path"],
+                        aoi_vector_path,
+                        mask_section["params"]["max_hours"],
+                        good_crs_for_aoi[aoi_key].get().crs,
+                        target_pop_raster_path,
+                        working_dir,
+                    ),
+                    store_result=True,
+                    target_path_list=[target_pop_raster_path],
+                    task_name=f"travel time for {aoi_key}",
+                )
+
                 task_graph.join()
                 return
 
@@ -1040,9 +1062,6 @@ def main() -> None:
                 raise ValueError(
                     f"unknown mask section type: {mask_section['type']}"
                 )
-            target_ds_mask_path = (
-                working_dir / f'{mask_section["id"]}_ds_mask.tif'
-            )
             # flow_accum_task = task_graph.add_task(
             #     func=routing.flow_accumulation_mfd,
             #     args=((flow_dir_path, 1), aoi_downstream_flow_mask_path),

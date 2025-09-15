@@ -36,5 +36,5 @@ sections:
     - logic: OR
 
 logging:
-  level: INFO
+  level: WARNING
   to_file: output.log
