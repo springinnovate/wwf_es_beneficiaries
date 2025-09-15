@@ -65,6 +65,37 @@ def _centroid_lon(minx: float, maxx: float) -> float:
     return _normalize_lon(mid)
 
 
+def create_circular_kernel(kernel_path, buffer_size_in_px):
+    diameter = buffer_size_in_px * 2 + 1
+    kernel_array = np.zeros((diameter, diameter), dtype=np.float32)
+    cx, cy = buffer_size_in_px, buffer_size_in_px
+
+    for i in range(diameter):
+        for j in range(diameter):
+            if (i - cx) ** 2 + (j - cy) ** 2 <= buffer_size_in_px**2:
+                kernel_array[i, j] = 1.0
+
+    driver = gdal.GetDriverByName("GTiff")
+    out_raster = driver.Create(
+        kernel_path,
+        diameter,
+        diameter,
+        1,
+        gdal.GDT_Float32,
+        options=(
+            "TILED=YES",
+            "BIGTIFF=YES",
+            "COMPRESS=LZW",
+            "BLOCKXSIZE=256",
+            "BLOCKYSIZE=256",
+            "NUM_THREADS=ALL_CPUS",
+        ),
+    )
+    out_raster.GetRasterBand(1).WriteArray(kernel_array)
+    out_raster.FlushCache()
+    out_raster = None
+
+
 def choose_equidistant_crs_from_bbox(aoi_vector_path: str) -> PickedCRS:
     """Pick a good CRS that is equadistant depending on size.
 
@@ -922,6 +953,9 @@ def calculate_ds_pop_from_conditional_raster(
     base_raster_path,
     condition_id,
     expression,
+    buffer_size_m,
+    wgs84_pixel_size,
+    travel_time_pixel_size_m,
     working_dir,
     target_pop_raster_path,
 ):
@@ -962,7 +996,7 @@ def calculate_ds_pop_from_conditional_raster(
         None,
     )
 
-    ds_coverage_raster_path = (
+    ds_coverage_raster_path = str(
         working_dir / f"ds_coverage_{condition_id}_{base_raster_path.stem}.tif"
     )
 
@@ -972,12 +1006,31 @@ def calculate_ds_pop_from_conditional_raster(
         weight_raster_path_band=(str(condition_raster_path), 1),
     )
 
+    buffer_amounts_in_pixels = int(
+        np.round(buffer_size_m / travel_time_pixel_size_m)
+    )
+
+    kernel_path = str(working_dir / f"{buffer_amounts_in_pixels}_kernel.tif")
+    create_circular_kernel(kernel_path, buffer_amounts_in_pixels)
+    buffered_ds_coverage_raster_path = "%s_buff%s" % os.path.splitext(
+        str(ds_coverage_raster_path)
+    )
+    geoprocessing.convolve_2d(
+        (ds_coverage_raster_path, 1),
+        (kernel_path, 1),
+        buffered_ds_coverage_raster_path,
+        n_workers=1,
+    )
+
     def mask_op(mask, pop_val):
         return np.where(mask > 0, pop_val, 0)
 
     pop_info = geoprocessing.get_raster_info(clipped_pop_raster_path)
     geoprocessing.raster_calculator(
-        [(str(ds_coverage_raster_path), 1), (str(clipped_pop_raster_path), 1)],
+        [
+            (str(buffered_ds_coverage_raster_path), 1),
+            (str(clipped_pop_raster_path), 1),
+        ],
         mask_op,
         target_pop_raster_path,
         pop_info["datatype"],
@@ -1139,6 +1192,9 @@ def main() -> None:
                         Path(mask_section["params"]["condition_raster_path"]),
                         section_id,
                         mask_section["params"]["expression"],
+                        config["inputs"]["buffer_size_m"],
+                        config["inputs"]["wgs84_pixel_size"],
+                        config["inputs"]["travel_time_pixel_size_m"],
                         working_dir,
                         target_pop_raster_path,
                     ),
