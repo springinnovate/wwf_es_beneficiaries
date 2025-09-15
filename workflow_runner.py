@@ -238,6 +238,7 @@ def process_config(config_path: Path) -> Dict[str, Any]:
     population_raster_path = inputs.get("population_raster_path", "")
     traveltime_raster_path = inputs.get("traveltime_raster_path", "")
     subwatershed_vector_path = inputs.get("subwatershed_vector_path", "")
+    dem_raster_path = inputs.get("dem_raster_path", "")
     aoi_vector_pattern = _as_list(inputs.get("aoi_vector_pattern", []))
 
     wgs84_pixel_size = inputs.get("wgs84_pixel_size", None)
@@ -253,6 +254,11 @@ def process_config(config_path: Path) -> Dict[str, Any]:
     if not traveltime_raster_path:
         missing_messages.append(
             "traveltime_raster_path (path to travel-time raster)"
+        )
+
+    if not dem_raster_path:
+        missing_messages.append(
+            "dem_raster_path (path to subwatershed shapefile/vector)"
         )
 
     if not subwatershed_vector_path:
@@ -355,6 +361,7 @@ def process_config(config_path: Path) -> Dict[str, Any]:
             "population_raster_path": population_raster_path,
             "traveltime_raster_path": traveltime_raster_path,
             "subwatershed_vector_path": subwatershed_vector_path,
+            "dem_raster_path": dem_raster_path,
             "aoi_vector_pattern": aoi_vector_pattern,
             "wgs84_pixel_size": float(wgs84_pixel_size),
             "travel_time_pixel_size_m": float(travel_time_pixel_size_m),
@@ -756,6 +763,7 @@ def main() -> None:
         base_raster_path_list = [
             config["inputs"]["population_raster_path"],
             config["inputs"]["traveltime_raster_path"],
+            config["inputs"]["dem_raster_path"],
         ]
         target_clipped_raster_path_list = [
             str(working_dir / f"{Path(path).stem}_clipped.tif")
