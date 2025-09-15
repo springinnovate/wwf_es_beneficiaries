@@ -7,13 +7,14 @@ docker build -t therealspring/ds_beneficiaries:latest . && docker run --rm -it -
 docker build -t ds_beneficiaries:latest . && docker run --rm -it -v `pwd`:/usr/local/wwf_es_beneficiaries ds_beneficiaries:latest
 """
 
+from __future__ import annotations
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import argparse
 import glob
 import logging
 import sys
-import time
 from itertools import islice
 
 from ecoshard import taskgraph
@@ -34,7 +35,128 @@ import numpy as np
 import pyproj
 import rasterio
 import pyogrio
-from pyproj import CRS, Transformer
+from pyproj import CRS, Transformer, Geod
+
+
+@dataclass
+class PickedCRS:
+    """Used to define a return type for CRS."""
+
+    crs: CRS
+    rationale: str
+
+
+def _normalize_lon(lon: float) -> float:
+    """Make sure long maps to -180/180."""
+    return ((lon + 180) % 360) - 180
+
+
+def _centroid_lon(minx: float, maxx: float) -> float:
+    """Make sure if the meridian is 360 we handle that."""
+    left, right = _normalize_lon(minx), _normalize_lon(maxx)
+    if right < left:  # wrapped
+        right += 360
+    mid = (right + left) / 2.0
+    return _normalize_lon(mid)
+
+
+def choose_equidistant_crs_from_bbox(aoi_vector_path: str) -> PickedCRS:
+    """Pick a good CRS that is equadistant depending on size.
+
+    Args:
+        minx,miny,maxx,maxy: geographic bbox in WGS84 degrees.
+
+    Returns:
+        PickedCRS with a pyproj.CRS and a rationale string.
+    """
+
+    aoi_gdf = gpd.read_file(aoi_vector_path)
+    aoi_gdf = aoi_gdf.set_geometry(aoi_gdf.geometry.make_valid())
+    if aoi_gdf.crs and aoi_gdf.crs.to_string() != "EPSG:4326":
+        aoi_gdf = aoi_gdf.to_crs("EPSG:4326")
+
+    minx, miny, maxx, maxy = aoi_gdf.total_bounds
+
+    # Normalize
+    minx_n, maxx_n = _normalize_lon(minx), _normalize_lon(maxx)
+    # Handle wrap for span
+    if maxx_n < minx_n:
+        maxx_span = maxx_n + 360
+        minx_span = minx_n
+    else:
+        minx_span, maxx_span = minx_n, maxx_n
+
+    lon_span_deg = maxx_span - minx_span
+    lat_span_deg = maxy - miny
+    lon0 = _centroid_lon(minx, maxx)
+    lat0 = (miny + maxy) / 2.0
+
+    # First, get the rough size in km using geodesic projection
+    geod = Geod(ellps="WGS84")
+    ew_km = abs(geod.line_length([minx, maxx], [lat0, lat0])) / 1000.0
+    ns_km = abs(geod.line_length([lon0, lon0], [miny, maxy])) / 1000.0
+    max_span_km = max(ew_km, ns_km)
+
+    # Choose UTM if within a single zone and not too close to poles
+    if lon_span_deg <= 6.0 and abs(lat0) < 84.0:
+        zone = int((lon0 + 180) // 6) + 1
+        # little trick to reverse engineer the epsg code
+        epsg = 32600 + zone if lat0 >= 0 else 32700 + zone
+        return PickedCRS(
+            crs=CRS.from_epsg(epsg),
+            rationale=(
+                f"UTM zone {zone} (EPSG:{epsg}) - bbox spans "
+                f"~{lon_span_deg:.1f} degrees, {max_span_km:.0f} km"
+            ),
+        )
+
+    # Regional if <= ~2500 km, asmuth equadistant centered on bbox centroid
+    if max_span_km <= 2500:
+        crs = CRS.from_proj4(
+            (
+                f"+proj=aeqd +lat_0={lat0:.8f} +lon_0={lon0:.8f} +x_0=0 +y_0=0 "
+                f"+datum=WGS84 +units=m +no_defs"
+            )
+        )
+        return PickedCRS(
+            crs=crs,
+            rationale=(
+                f"Azimuthal Equidistant centered at ({lat0:.4f}, {lon0:.4f}) "
+                f"- preserves distances from center; span {max_span_km:.0f} "
+                f"km"
+            ),
+        )
+
+    # big problem if very wide EW, use Equidistant Conic with parallels
+    # near lower/upper lat
+    if ew_km > ns_km:
+        lat1 = miny + lat_span_deg * 0.25
+        lat2 = miny + lat_span_deg * 0.75
+        crs = CRS.from_proj4(
+            f"+proj=eqdc +lat_1={lat1:.8f} +lat_2={lat2:.8f} "
+            f"+lat_0={lat0:.8f} +lon_0={lon0:.8f} "
+            f"+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+        )
+        return PickedCRS(
+            crs=crs,
+            rationale=(
+                f"Equidistant Conic (lat1={lat1:.2f}, lat2={lat2:.2f}) "
+                f"- large E–W extent {ew_km:.0f} km"
+            ),
+        )
+
+    # fallback, AEQD for very tall regions
+    crs = CRS.from_proj4(
+        f"+proj=aeqd +lat_0={lat0:.8f} +lon_0={lon0:.8f} +x_0=0 +y_0=0 "
+        f"+datum=WGS84 +units=m +no_defs"
+    )
+    return PickedCRS(
+        crs=crs,
+        rationale=(
+            f"Azimuthal Equidistant fallback - "
+            f"large N–S extent {ns_km:.0f} km"
+        ),
+    )
 
 
 def _as_list(x: Any) -> List[Any]:
@@ -381,18 +503,45 @@ def _chunks(iterable, size):
 def subset_subwatersheds(
     aoi_vector_path: str | Path,
     subwatershed_vector_path: str | Path,
-    subset_subwatersheds_vector_path: str | Path,
+    target_crs: PickedCRS,
+    target_subset_subwatersheds_vector_path: str | Path,
 ) -> None:
+    """Extract and save all sub-watersheds downstream of a given AOI.
+
+    This function reads an area of interest (AOI) polygon, identifies the set
+    of sub-watersheds in the input vector layer that intersect the AOI, and
+    traverses their `NEXT_DOWN` links to collect all downstream sub-watersheds.
+    The resulting geometries are re-projected to the provided target CRS and
+    written to disk.
+
+    Args:
+        aoi_vector_path (str | Path): Path to the AOI vector dataset
+            (any format readable by GeoPandas/pyogrio).
+        subwatershed_vector_path (str | Path): Path to the sub-watershed
+            dataset containing `HYBAS_ID`, `NEXT_DOWN`, and geometry columns.
+        target_crs (PickedCRS): Target coordinate reference system for the
+            output, typically selected by a helper such as
+            ``choose_equidistant_crs_from_bbox``.
+        target_subset_subwatersheds_vector_path (str | Path): Destination
+            file path where the subset of downstream sub-watersheds will be
+            written (e.g., a GeoPackage ``.gpkg``) and CRS is explicitly set to
+            ``target_crs``
+
+    Returns:
+        None: The function writes the downstream sub-watersheds to the specified
+        file and does not return anything.
+
+    Raises:
+        ValueError: If required attributes (``HYBAS_ID`` or ``NEXT_DOWN``) are
+            missing, or if the AOI and sub-watershed geometries do not overlap.
+    """
     logger = logging.getLogger(__name__)
     logger.info(f"processing aoi {aoi_vector_path}")
 
     # Read AOI and precompute union + bbox; repair invalid with make_valid if available
     aoi_gdf = gpd.read_file(aoi_vector_path)
     aoi_crs = aoi_gdf.crs
-    if hasattr(aoi_gdf.geometry, "make_valid"):
-        aoi_gdf = aoi_gdf.set_geometry(aoi_gdf.geometry.make_valid())
-    else:
-        aoi_gdf = aoi_gdf.set_geometry(aoi_gdf.geometry.buffer(0))
+    aoi_gdf = aoi_gdf.set_geometry(aoi_gdf.geometry.make_valid())
     aoi_union = aoi_gdf.geometry.union_all()
     aoi_bbox = box(*aoi_gdf.total_bounds)
 
@@ -424,19 +573,13 @@ def subset_subwatersheds(
         columns=["HYBAS_ID", "NEXT_DOWN", "geometry"],
     )
     if sub_bbox_gdf.empty:
-        gpd.GeoDataFrame(geometry=[], crs=aoi_crs).to_file(
-            subset_subwatersheds_vector_path, driver="GPKG"
-        )
-        logger.warning("No candidates found in bbox; wrote empty GPKG.")
-        return
+        raise ValueError(f"No candidates found in bbox for {aoi_vector_path}.")
 
     hits = sub_bbox_gdf.sindex.query(aoi_union, predicate="intersects")
     if len(hits) == 0:
-        gpd.GeoDataFrame(geometry=[], crs=aoi_crs).to_file(
-            subset_subwatersheds_vector_path, driver="GPKG"
+        raise ValueError(
+            f"No intersecting sub-watersheds for {aoi_vector_path}."
         )
-        logger.warning("No intersecting sub-watersheds; wrote empty GPKG.")
-        return
 
     initial = sub_bbox_gdf.iloc[hits]
     initial_ids = set(initial["HYBAS_ID"].tolist())
@@ -456,11 +599,7 @@ def subset_subwatersheds(
         ds_ids_to_process = next_ids - visited_ids
 
     if not visited_ids:
-        gpd.GeoDataFrame(geometry=[], crs=aoi_crs).to_file(
-            subset_subwatersheds_vector_path, driver="GPKG"
-        )
-        logger.warning("No valid geometry found; wrote empty GPKG.")
-        return
+        raise ValueError(f"No valid geometry found for {aoi_vector_path}.")
 
     # Fetch geometries for all_ids using batched attribute filters
     logger.info(f"fetch geometries by attribute filter {aoi_vector_path}")
@@ -475,11 +614,7 @@ def subset_subwatersheds(
         downstream_features.append(df)
 
     if not downstream_features:
-        gpd.GeoDataFrame(geometry=[], crs=aoi_crs).to_file(
-            subset_subwatersheds_vector_path, driver="GPKG"
-        )
-        logger.warning("No geometries returned; wrote empty GPKG.")
-        return
+        raise ValueError(f"No geometries returned for {aoi_vector_path}.")
 
     sub_gdf = pd.concat(downstream_features, ignore_index=True)
     sub_gdf = gpd.GeoDataFrame(sub_gdf, crs=sub_crs)
@@ -500,89 +635,9 @@ def subset_subwatersheds(
     if sub_crs and aoi_crs and sub_crs != aoi_crs:
         sub_gdf = sub_gdf.to_crs(aoi_crs)
 
-    sub_gdf.to_file(subset_subwatersheds_vector_path, driver="GPKG")
+    sub_gdf = sub_gdf.to_crs(target_crs.crs)
+    sub_gdf.to_file(target_subset_subwatersheds_vector_path, driver="GPKG")
     logger.info(f"all done subwatershedding {aoi_vector_path}")
-
-
-# def subset_subwatersheds(
-#     aoi_vector_path,
-#     subwatershed_vector_path,
-#     target_subset_subwatersheds_vector_path,
-# ):
-#     logger = logging.getLogger(__name__)
-#     logger.info(f"processing aoi {aoi_vector_path}")
-#     aoi_gdf = gpd.read_file(aoi_vector_path)
-#     aoi_gdf["geometry"] = aoi_gdf["geometry"].buffer(0)
-#     aoi_union = aoi_gdf.unary_union
-#     aoi_bbox = box(*aoi_gdf.total_bounds)
-#     aoi_crs = aoi_gdf.crs
-
-#     logger.info(f"Sub‑watershed CRS & ID ->NEXT mapping  {aoi_vector_path}")
-#     with fiona.open(subwatershed_vector_path, "r") as src:
-#         sub_crs = src.crs
-#         layer_name = src.name
-#         hybas_to_nextdown = {
-#             f["properties"]["HYBAS_ID"]: f["properties"]["NEXT_DOWN"]
-#             for f in src
-#         }
-
-#     logger.info(f"Reproject AOI to sub‑watershed CRS {aoi_vector_path}")
-#     if aoi_crs != sub_crs:
-#         tform = pyproj.Transformer.from_crs(
-#             aoi_crs, sub_crs, always_xy=True
-#         ).transform
-#         aoi_bbox = transform(tform, aoi_bbox)
-#         aoi_union = transform(tform, aoi_union)
-
-#     logger.info(f"Fast spatial pre-filter {aoi_vector_path}")
-#     sub_bbox_gdf = gpd.read_file(subwatershed_vector_path, bbox=aoi_bbox.bounds)
-#     hits = sub_bbox_gdf.sindex.query(aoi_union, predicate="intersects")
-#     initial = sub_bbox_gdf.iloc[hits]
-
-#     logger.info(f"Downstream BFS {aoi_vector_path}")
-#     all_ids = set(initial["HYBAS_ID"])
-#     queue = set(initial["NEXT_DOWN"]) - {0}
-#     while queue:
-#         all_ids.update(queue)
-#         queue = (
-#             {
-#                 hybas_to_nextdown.get(hid)
-#                 for hid in queue
-#                 if hid in hybas_to_nextdown
-#             }
-#             - all_ids
-#             - {0}
-#         )
-
-#     if not all_ids:
-#         gpd.GeoDataFrame({"geometry": []}, crs=aoi_crs).to_file(
-#             target_subset_subwatersheds_vector_path, driver="GPKG"
-#         )
-#         logger.warning("No valid geometry found; wrote empty GPKG.")
-#         return
-
-#     logger.info(f"Fetch geometries with attribute SQL {aoi_vector_path}")
-#     gdf_parts = []
-#     for id_chunk in _chunks(all_ids, 1000):
-#         id_list = ",".join(map(str, id_chunk))
-#         sql = f'SELECT * FROM "{layer_name}" WHERE HYBAS_ID IN ({id_list})'
-#         gdf_parts.append(gpd.read_file(subwatershed_vector_path, sql=sql))
-#     sub_gdf = gpd.GeoDataFrame(
-#         pd.concat(gdf_parts, ignore_index=True), crs=sub_crs
-#     )
-
-#     logger.info(f"Repair only invalid geometries {aoi_vector_path}")
-#     invalid = ~sub_gdf.geometry.is_valid
-#     if invalid.any():
-#         sub_gdf.loc[invalid, "geometry"] = sub_gdf.loc[
-#             invalid, "geometry"
-#         ].buffer(0)
-
-#     logger.info(f"Reproject to AOI CRS & write {aoi_vector_path}")
-#     if sub_crs != aoi_crs:
-#         sub_gdf = sub_gdf.to_crs(aoi_crs)
-#     sub_gdf.to_file(target_subset_subwatersheds_vector_path, driver="GPKG")
-#     logger.info(f"all done subwatershedding {aoi_vector_path}")
 
 
 def main() -> None:
@@ -618,6 +673,16 @@ def main() -> None:
     logging.basicConfig()
     task_graph = taskgraph.TaskGraph(config["work_dir"], n_workers, update_rate)
     logging.getLogger("ecoshard").setLevel(config["logging"]["level"])
+    good_crs_for_aoi = {}
+    for aoi_key, aoi_path in aoi_id_to_path.items():
+        crs_task = task_graph.add_task(
+            func=choose_equidistant_crs_from_bbox,
+            args=(aoi_path,),
+            store_result=True,
+            task_name=f"calculate CRS for {aoi_key}",
+        )
+        good_crs_for_aoi[aoi_key] = crs_task
+
     for aoi_key, aoi_path in aoi_id_to_path.items():
         working_dir = Path(config["work_dir"]) / Path(aoi_key)
         working_dir.mkdir(parents=True, exist_ok=True)
@@ -629,21 +694,69 @@ def main() -> None:
             args=(
                 aoi_path,
                 config["inputs"]["subwatershed_vector_path"],
+                good_crs_for_aoi[aoi_key].get(),
                 target_subwatershed_path,
             ),
             target_path_list=[target_subwatershed_path],
             task_name=f"subset downstream from {aoi_key}",
         )
+        # TODO: find a good CRS
+        clip_tasks = {}
+        for raster_path in ["population_raster_path", "dem_raster_path"]:
+            # TODO:
+            task = None
+            clip_tasks[aoi_key] = task
+            # clip `raster_path` to `target_subwatershed_path` and project
+            # to CRS
+            pass
+
+        flow_dir_path = working_dir / f"{aoi_key}_flow_dir.tif"
+        # flow_dir_task = task_graph.add_task(
+        #     func=calc_flow_dir,
+        #     args=(
+        #         analysis_id,
+        #         DEM_RASTER_PATH,
+        #         subset_subwatersheds_vector_path,
+        #         clipped_dem_path,
+        #         flow_dir_path,
+        #     ),
+        #     dependent_task_list=[clip_tasks["dem_raster_path"]],
+        #     target_path_list=[flow_dir_path, clipped_dem_path],
+        #     task_name=f"calculate flow dir for {analysis_id}",
+        # )
+
+        for mask_section in config["sections"]["masks"]:
+            target_mask_path = working_dir / f'{mask_section["id"]}_mask.tif'
+            if mask_section["type"] == "travel_time_population":
+                # TODO: apply travel time function to
+                pass
+            elif mask_section["type"] == "conditional_raster":
+                pass
+            else:
+                raise ValueError(
+                    f"unknown mask section type: {mask_section['type']}"
+                )
+            target_ds_mask_path = (
+                working_dir / f'{mask_section["id"]}_ds_mask.tif'
+            )
+            # flow_accum_task = task_graph.add_task(
+            #     func=routing.flow_accumulation_mfd,
+            #     args=((flow_dir_path, 1), aoi_downstream_flow_mask_path),
+            #     kwargs={"weight_raster_path_band": (aoi_raster_mask_path, 1)},
+            #     dependent_task_list=[flow_dir_task, rasterize_task],
+            #     target_path_list=[aoi_downstream_flow_mask_path],
+            #     task_name=f"flow accum for {analysis_id}",
+            # )
 
     task_graph.join()
     task_graph.close()
 
     # TODO:
-    # - loop through each aoi vector pattern
-    #   - create a working directory for the project under config["work_dir"]/aoi.stem
-    #   - determine which features in subwatershed_vector_path intersect with
+    # x loop through each aoi vector pattern
+    #   x create a working directory for the project under config["work_dir"]/aoi.stem
+    #   x determine which features in subwatershed_vector_path intersect with
     #     the aoi
-    #     - make a set of the features which intersect and ALL features that
+    #     x make a set of the features which intersect and ALL features that
     #       are downstream of it until there are no more downstream. The
     #       downstream feature is identified by looking at the current feature's
     #       `NEXT_DOWN` field. If it is 0 there are no downstream features

@@ -5,6 +5,7 @@ output_dir: ./output_dir
 inputs:
   population_raster_path: "./Data for analyses/pop_rasters/landscan-global-2023.tif"
   traveltime_raster_path: "./Data for analyses/travel_time/friction_surface_2019_compressed_md5_1be7dd230178a5d395529be7a5e3fb0a.tif"
+  dem_raster_path: "./Data for analyses/dem_precondition/astgtm_compressed.tif"
   subwatershed_vector_path: "./Data for analyses/dem_precondition/merged_lev06.shp"
   aoi_vector_pattern:
     - "./Data for analyses/aois/aoi_by_country/*.gpkg"
