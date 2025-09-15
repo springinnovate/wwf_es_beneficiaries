@@ -22,6 +22,7 @@ from ecoshard import taskgraph
 import psutil
 import yaml
 
+from rasterio.warp import calculate_default_transform, reproject, Resampling
 from ecoshard import geoprocessing
 from ecoshard import taskgraph
 from ecoshard.geoprocessing import routing
@@ -35,8 +36,11 @@ import pandas as pd
 import numpy as np
 import pyproj
 import rasterio
+import rasterio.mask
 import pyogrio
 from pyproj import CRS, Transformer, Geod
+
+import shortest_distances
 
 
 @dataclass
@@ -358,10 +362,10 @@ def process_config(config_path: Path) -> Dict[str, Any]:
         "work_dir": work_dir,
         "output_dir": output_dir,
         "inputs": {
-            "population_raster_path": population_raster_path,
-            "traveltime_raster_path": traveltime_raster_path,
-            "subwatershed_vector_path": subwatershed_vector_path,
-            "dem_raster_path": dem_raster_path,
+            "population_raster_path": Path(population_raster_path),
+            "traveltime_raster_path": Path(traveltime_raster_path),
+            "subwatershed_vector_path": Path(subwatershed_vector_path),
+            "dem_raster_path": Path(dem_raster_path),
             "aoi_vector_pattern": aoi_vector_pattern,
             "wgs84_pixel_size": float(wgs84_pixel_size),
             "travel_time_pixel_size_m": float(travel_time_pixel_size_m),
@@ -692,6 +696,219 @@ def align_and_resize_raster_stack_on_vector(
     )
 
 
+def eck4_limits(r=6371000):
+    crs_eck4 = CRS.from_proj4(f"+proj=eck4 +R={r} +units=m +no_defs")
+    T_fwd = Transformer.from_crs("EPSG:4326", crs_eck4, always_xy=True)
+    xs, ys = T_fwd.transform([-180, 180, 0, 0], [0, 0, 90, -90])
+    return abs(xs[0]), abs(ys[2])  # xmax, ymax
+
+
+ECKERT_IV_MAX_X, ECKERT_IV_MAX_Y = eck4_limits()  # ≈ 15 110 000 , 7 540 000
+
+
+def _clamp_eckert_point(x, y):
+    r2 = (x * x) / (ECKERT_IV_MAX_X * ECKERT_IV_MAX_X) + (y * y) / (
+        ECKERT_IV_MAX_Y * ECKERT_IV_MAX_Y
+    )
+    if r2 <= 1:
+        return x, y
+    scale = 0.999 / r2**2
+    return x * scale, y * scale
+
+
+def transform_edge_points_eckert_to_wgs84(bbox_gdf, dst_crs="EPSG:4326"):
+    if bbox_gdf.crs is None:
+        raise ValueError("bbox_gdf must have a CRS defined")
+    if "+proj=eck4" not in bbox_gdf.crs.to_proj4().lower():
+        return bbox_gdf.to_crs(dst_crs)
+
+    minx, miny, maxx, maxy = bbox_gdf.total_bounds
+    raw_corners = [(minx, miny), (minx, maxy), (maxx, maxy), (maxx, miny)]
+    safe_corners = [_clamp_eckert_point(x, y) for x, y in raw_corners]
+
+    transformer = Transformer.from_crs(bbox_gdf.crs, dst_crs, always_xy=True)
+    lonlat = [transformer.transform(x, y) for x, y in safe_corners]
+    xs, ys = zip(*lonlat)
+    proj_box = box(min(xs), min(ys), max(xs), max(ys))
+    return gpd.GeoDataFrame(geometry=[proj_box], crs=dst_crs)
+
+
+def _clip_and_reproject_raster(
+    base_raster_path, bbox_gdf, dst_crs, target_raster_path, reference_meta=None
+):
+    logger = logging.getLogger(__name__)
+    with rasterio.open(base_raster_path) as src:
+        if bbox_gdf.crs is None:
+            raise ValueError("bbox_gdf must have a CRS defined")
+
+        if "+proj=eck4" in bbox_gdf.crs.to_proj4().lower():
+            logger.info(
+                "eckert is so broken, just doing regular lat/lng bounds"
+            )
+            projected_box_gdf = transform_edge_points_eckert_to_wgs84(bbox_gdf)
+            projected_box_gdf = gpd.GeoDataFrame(
+                geometry=[box(-179, -80, 179, 80)], crs="EPSG:4326"
+            )
+        else:
+            # Check intermediate clamped bounds explicitly:
+            logger.info(f"Clamped bbox bounds: {bbox_gdf.total_bounds}")
+
+            # Safely project to src.crs (e.g., EPSG:4326)
+            projected_box_gdf = bbox_gdf.to_crs(src.crs)
+
+        bbox_projected_geom = [projected_box_gdf.geometry.iloc[0]]
+        out_image, out_transform = rasterio.mask.mask(
+            src, bbox_projected_geom, crop=True
+        )
+
+        if reference_meta:
+            dst_transform = reference_meta["transform"]
+            width = reference_meta["width"]
+            height = reference_meta["height"]
+        else:
+            dst_transform, width, height = calculate_default_transform(
+                src.crs,
+                dst_crs,
+                out_image.shape[2],
+                out_image.shape[1],
+                *projected_box_gdf.total_bounds,
+            )
+
+        out_meta = src.meta.copy()
+        out_meta.update(
+            {
+                "driver": "GTiff",
+                "crs": dst_crs,
+                "transform": dst_transform,
+                "width": width,
+                "height": height,
+            }
+        )
+
+        with rasterio.open(target_raster_path, "w", **out_meta) as dst:
+            reproject(
+                source=out_image,
+                destination=rasterio.band(dst, 1),
+                src_transform=out_transform,
+                src_crs=src.crs,
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+                resampling=Resampling.nearest,
+            )
+
+
+def apply_travel_time_mask(
+    traveltime_raster_path: Path,
+    population_raster_path: Path,
+    aoi_vector_path: Path,
+    max_hours: float,
+    target_crs: str,
+    working_dir: Path,
+):
+    """
+    Create a travel-time mask clipped to an AOI.
+
+    Args:
+        traveltime_raster_path (str | Path): Path to a raster where each pixel
+            encodes travel time (hours) to a target destination.
+        aoi_vector_path (str | Path): Path to a vector dataset (e.g. Shapefile,
+            GeoPackage) defining the area of interest to clip to.
+        max_hours (float): Maximum travel time in hours to include.
+
+    Returns:
+        rasterio.io.DatasetReader: An in-memory raster mask where pixels within
+        the AOI and <= max_hours are valid (1), and others are nodata (0).
+    """
+    logger = logging.getLogger(__name__)
+    max_time_mins = max_hours * 60
+
+    aoi_vector = gpd.read_file(aoi_vector_path)
+    projected_gdf = aoi_vector.to_crs(target_crs)
+    bbox = projected_gdf.total_bounds
+    buffer_distance_m = (
+        max_hours * 104 * 1000
+    )  # drive 65mph for that many hours
+
+    buffered_bbox = box(
+        bbox[0] - buffer_distance_m,
+        bbox[1] - buffer_distance_m,
+        bbox[2] + buffer_distance_m,
+        bbox[3] + buffer_distance_m,
+    )
+
+    logger.info(f"buffered box: {buffered_bbox}")
+    bbox_gdf = gpd.GeoDataFrame(
+        {"geometry": [buffered_bbox]}, crs=projected_gdf.crs
+    )
+
+    target_pop_clipped_raster_path = Path(
+        working_dir / f"{traveltime_raster_path.stem}_travel_clip.tif"
+    )
+    target_friction_clipped_raster_path = Path(
+        working_dir / f"{traveltime_raster_path.stem}_travel_clip.tif"
+    )
+    target_aoi_raster_path = Path(working_dir / "travel_time_aoi_mask.tif")
+
+    _clip_and_reproject_raster(
+        population_raster_path,
+        bbox_gdf,
+        projected_gdf.crs,
+        target_pop_clipped_raster_path,
+    )
+
+    with rasterio.open(target_pop_clipped_raster_path) as pop_ref:
+        ref_meta = pop_ref.meta.copy()
+        pop_array = pop_ref.read(1).astype(np.int64)
+
+    _clip_and_reproject_raster(
+        traveltime_raster_path,
+        bbox_gdf,
+        projected_gdf.crs,
+        target_friction_clipped_raster_path,
+        reference_meta=ref_meta,
+    )
+
+    mask_array = rasterio.features.rasterize(
+        ((geom, 1) for geom in projected_gdf.geometry),
+        out_shape=(ref_meta["height"], ref_meta["width"]),
+        transform=ref_meta["transform"],
+        fill=0,
+        dtype=rasterio.uint8,
+    ).astype(np.int8)
+
+    aoi_meta = ref_meta.copy()
+    aoi_meta.update(
+        {"count": 1, "dtype": rasterio.uint8, "nodata": 0, "compress": "lzw"}
+    )
+
+    with rasterio.open(target_aoi_raster_path, "w", **aoi_meta) as dst:
+        dst.write(mask_array, 1)
+
+    with rasterio.open(target_friction_clipped_raster_path) as friction_ds:
+        friction_array = friction_ds.read(1)
+        transform = friction_ds.transform
+        cell_length_m = transform.a
+        n_rows, n_cols = friction_array.shape
+
+    travel_reach_array = shortest_distances.find_mask_reach(
+        friction_array, mask_array, cell_length_m, n_cols, n_rows, max_time_mins
+    )
+
+    target_max_reach_raster_path = (
+        working_dir / f"max_reach_{max_time_mins}min.tif"
+    )
+
+    with rasterio.open(
+        target_max_reach_raster_path, "w", **aoi_meta
+    ) as max_reach:
+        max_reach.write(travel_reach_array, 1)
+
+    in_range_pop_count = np.sum(
+        pop_array[(travel_reach_array > 0) & (pop_array > 0)]
+    )
+    return in_range_pop_count
+
+
 def main() -> None:
     """Entry point."""
     ap = argparse.ArgumentParser(
@@ -787,12 +1004,12 @@ def main() -> None:
         )
 
         target_flow_dir_raster_path = "%s_mfdflow%s" % os.path.splitext(
-            clipped_dem_path
+            str(clipped_dem_path)
         )
         flow_dir_task = task_graph.add_task(
-            func=routing.calc_flow_dir,
+            func=routing.flow_dir_mfd,
             args=(
-                clipped_dem_path,
+                (clipped_dem_path, 1),
                 target_flow_dir_raster_path,
             ),
             kwargs={"working_dir": working_dir},
@@ -801,15 +1018,24 @@ def main() -> None:
             task_name=f"calculate flow dir for {aoi_key}",
         )
 
-        flow_dir_task.join()
-        return
-        for mask_section in config["sections"]["masks"]:
-            target_mask_path = working_dir / f'{mask_section["id"]}_mask.tif'
+        logger.info(good_crs_for_aoi[aoi_key].get())
+        for mask_section in config["masks"]:
+            # target_mask_path = working_dir / f'{mask_section["id"]}_mask.tif'
             if mask_section["type"] == "travel_time_population":
                 # TODO: apply travel time function to
-                pass
+                apply_travel_time_mask(
+                    config["inputs"]["traveltime_raster_path"],
+                    config["inputs"]["population_raster_path"],
+                    aoi_vector_path,
+                    mask_section["params"]["max_hours"],
+                    good_crs_for_aoi[aoi_key].get().crs,
+                    working_dir,
+                )
+                task_graph.join()
+                return
+
             elif mask_section["type"] == "conditional_raster":
-                pass
+                continue
             else:
                 raise ValueError(
                     f"unknown mask section type: {mask_section['type']}"
