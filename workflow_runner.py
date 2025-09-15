@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import argparse
+import os
 import glob
 import logging
 import sys
@@ -239,6 +240,10 @@ def process_config(config_path: Path) -> Dict[str, Any]:
     subwatershed_vector_path = inputs.get("subwatershed_vector_path", "")
     aoi_vector_pattern = _as_list(inputs.get("aoi_vector_pattern", []))
 
+    wgs84_pixel_size = inputs.get("wgs84_pixel_size", None)
+    travel_time_pixel_size_m = inputs.get("travel_time_pixel_size_m", None)
+    buffer_size_m = inputs.get("buffer_size_m", None)
+
     missing_messages = []
     if not population_raster_path:
         missing_messages.append(
@@ -258,6 +263,21 @@ def process_config(config_path: Path) -> Dict[str, Any]:
     if not aoi_vector_pattern:
         missing_messages.append(
             "aoi_vector_pattern (one or more AOI file patterns)"
+        )
+
+    if wgs84_pixel_size is None:
+        missing_messages.append(
+            "wgs84_pixel_size (pixel size of population raster in degrees)"
+        )
+
+    if travel_time_pixel_size_m is None:
+        missing_messages.append(
+            "travel_time_pixel_size_m (pixel size of travel-time raster in meters)"
+        )
+
+    if buffer_size_m is None:
+        missing_messages.append(
+            "buffer_size_m (buffer size in meters for AOI expansion)"
         )
 
     if missing_messages:
@@ -336,6 +356,9 @@ def process_config(config_path: Path) -> Dict[str, Any]:
             "traveltime_raster_path": traveltime_raster_path,
             "subwatershed_vector_path": subwatershed_vector_path,
             "aoi_vector_pattern": aoi_vector_pattern,
+            "wgs84_pixel_size": float(wgs84_pixel_size),
+            "travel_time_pixel_size_m": float(travel_time_pixel_size_m),
+            "buffer_size_m": float(buffer_size_m),
         },
         "masks": masks,
         "combine": combine_logic,
@@ -640,6 +663,28 @@ def subset_subwatersheds(
     logger.info(f"all done subwatershedding {aoi_vector_path}")
 
 
+def align_and_resize_raster_stack_on_vector(
+    raster_path_list,
+    target_path_list,
+    resample_method_list,
+    target_pixel_size,
+    bounding_vector_path,
+):
+    gdf = gpd.read_file(bounding_vector_path)
+    gdf = gdf.set_geometry(gdf.geometry.make_valid())
+    if not gdf.crs or gdf.crs.to_string() != "EPSG:4326":
+        gdf = gdf.to_crs("EPSG:4326")
+
+    # minx, miny, maxx, maxy = gdf.total_bounds
+    geoprocessing.align_and_resize_raster_stack(
+        raster_path_list,
+        target_path_list,
+        resample_method_list,
+        target_pixel_size,
+        [float(x) for x in gdf.total_bounds],
+    )
+
+
 def main() -> None:
     """Entry point."""
     ap = argparse.ArgumentParser(
@@ -665,7 +710,6 @@ def main() -> None:
     logger.info(f"{args.config} read successfully")
 
     aoi_id_to_path = collect_aoi_files(config)
-    logger.debug(aoi_id_to_path)
     logger.info(f"found {len(aoi_id_to_path)} aois to process")
 
     n_workers = min(len(aoi_id_to_path), psutil.cpu_count(logical=False))
@@ -673,17 +717,25 @@ def main() -> None:
     logging.basicConfig()
     task_graph = taskgraph.TaskGraph(config["work_dir"], n_workers, update_rate)
     logging.getLogger("ecoshard").setLevel(config["logging"]["level"])
+
+    # these drive how we cut, reproject, and determine distance
+    wgs84_pixel_size = config["inputs"]["wgs84_pixel_size"]
+    travel_time_pixel_size_m = config["inputs"]["travel_time_pixel_size_m"]
+    km_in_deg = wgs84_pixel_size * 1000 / travel_time_pixel_size_m
+    buffer_size_m = config["inputs"]["buffer_size_m"]
+    buffer_size_in_pixels = km_in_deg / wgs84_pixel_size * buffer_size_m
+
     good_crs_for_aoi = {}
-    for aoi_key, aoi_path in aoi_id_to_path.items():
+    for aoi_key, aoi_vector_path in aoi_id_to_path.items():
         crs_task = task_graph.add_task(
             func=choose_equidistant_crs_from_bbox,
-            args=(aoi_path,),
+            args=(aoi_vector_path,),
             store_result=True,
             task_name=f"calculate CRS for {aoi_key}",
         )
         good_crs_for_aoi[aoi_key] = crs_task
 
-    for aoi_key, aoi_path in aoi_id_to_path.items():
+    for aoi_key, aoi_vector_path in aoi_id_to_path.items():
         working_dir = Path(config["work_dir"]) / Path(aoi_key)
         working_dir.mkdir(parents=True, exist_ok=True)
         target_subwatershed_path = working_dir / Path(
@@ -692,7 +744,7 @@ def main() -> None:
         subset_task = task_graph.add_task(
             func=subset_subwatersheds,
             args=(
-                aoi_path,
+                aoi_vector_path,
                 config["inputs"]["subwatershed_vector_path"],
                 good_crs_for_aoi[aoi_key].get(),
                 target_subwatershed_path,
@@ -700,15 +752,31 @@ def main() -> None:
             target_path_list=[target_subwatershed_path],
             task_name=f"subset downstream from {aoi_key}",
         )
-        # TODO: find a good CRS
-        clip_tasks = {}
-        for raster_path in ["population_raster_path", "dem_raster_path"]:
-            # TODO:
-            task = None
-            clip_tasks[aoi_key] = task
-            # clip `raster_path` to `target_subwatershed_path` and project
-            # to CRS
-            pass
+        wgs84_pixel_size = config["inputs"]["wgs84_pixel_size"]
+        base_raster_path_list = [
+            config["inputs"]["population_raster_path"],
+            config["inputs"]["traveltime_raster_path"],
+        ]
+        target_clipped_raster_path_list = [
+            str(working_dir / f"{Path(path).stem}_clipped.tif")
+            for path in base_raster_path_list
+        ]
+
+        clip_task = task_graph.add_task(
+            func=align_and_resize_raster_stack_on_vector,
+            args=(
+                base_raster_path_list,
+                target_clipped_raster_path_list,
+                ["near"] * len(base_raster_path_list),
+                [wgs84_pixel_size, -wgs84_pixel_size],
+                target_subwatershed_path,
+            ),
+            dependent_task_list=[subset_task],
+            target_path_list=target_clipped_raster_path_list,
+            task_name=f"clip base data for {aoi_key}",
+        )
+        clip_task.join()
+        return
 
         flow_dir_path = working_dir / f"{aoi_key}_flow_dir.tif"
         # flow_dir_task = task_graph.add_task(

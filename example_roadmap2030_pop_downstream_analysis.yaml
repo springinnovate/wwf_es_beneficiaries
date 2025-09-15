@@ -3,6 +3,10 @@ work_dir: ./working_dir
 output_dir: ./output_dir
 
 inputs:
+  # leave pixel sizes alone unless you know what you're doing
+  wgs84_pixel_size: 0.008333333333333
+  travel_time_pixel_size_m: 900
+  buffer_size_m: 1000
   population_raster_path: "./Data for analyses/pop_rasters/landscan-global-2023.tif"
   traveltime_raster_path: "./Data for analyses/travel_time/friction_surface_2019_compressed_md5_1be7dd230178a5d395529be7a5e3fb0a.tif"
   dem_raster_path: "./Data for analyses/dem_precondition/astgtm_compressed.tif"
