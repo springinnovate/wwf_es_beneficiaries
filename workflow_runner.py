@@ -302,6 +302,9 @@ def process_config(config_path: Path) -> Dict[str, Any]:
         missing_messages.append(
             f"traveltime_raster_path does not exist: {traveltime_raster_path}"
         )
+        missing_messages.append(
+            "population_raster_path (path to population raster)"
+        )
 
     if not dem_raster_path:
         missing_messages.append("dem_raster_path (path to DEM raster)")
@@ -978,7 +981,6 @@ def calculate_ds_pop_from_conditional_raster(
     working_dir,
     target_pop_raster_path,
 ):
-
     condition_raster_path = (
         working_dir / f"mask_{condition_id}_{base_raster_path.stem}.tif"
     )
@@ -1292,7 +1294,8 @@ def main() -> None:
         combined_header = "combined pop"
         section_mask_ids.add(combined_header)
         pop_results[aoi_key][combined_header] = combined_task
-        break
+
+    task_graph.join()
 
     rows = []
     for aoi_key, results in pop_results.items():
@@ -1313,7 +1316,6 @@ def main() -> None:
         / f'{config["run_name"]}_{datetime.now().strftime("%Y_%m_%d_%H_%M_%S")}.csv'
     )
     df.to_csv(csv_path, index=False)
-    task_graph.join()
     task_graph.close()
 
     # TODO:
