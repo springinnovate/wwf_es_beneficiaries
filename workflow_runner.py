@@ -9,6 +9,7 @@ docker build -t ds_beneficiaries:latest . && docker run --rm -it -v `pwd`:/usr/l
 
 from __future__ import annotations
 from dataclasses import dataclass
+import collections
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import argparse
@@ -24,7 +25,6 @@ import yaml
 
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from ecoshard import geoprocessing
-from ecoshard import taskgraph
 from ecoshard.geoprocessing import routing
 from osgeo import gdal
 from shapely.geometry import box
@@ -74,7 +74,6 @@ def choose_equidistant_crs_from_bbox(aoi_vector_path: str) -> PickedCRS:
     Returns:
         PickedCRS with a pyproj.CRS and a rationale string.
     """
-
     aoi_gdf = gpd.read_file(aoi_vector_path)
     aoi_gdf = aoi_gdf.set_geometry(aoi_gdf.geometry.make_valid())
     if aoi_gdf.crs and aoi_gdf.crs.to_string() != "EPSG:4326":
@@ -916,6 +915,91 @@ def apply_travel_time_mask(
     return np.sum(pop_masked_array)
 
 
+def calculate_ds_pop_from_conditional_raster(
+    aoi_vector_path,
+    flow_dir_raster_path,
+    clipped_pop_raster_path,
+    base_raster_path,
+    condition_id,
+    expression,
+    working_dir,
+    target_pop_raster_path,
+):
+
+    condition_raster_path = (
+        working_dir / f"mask_{condition_id}_{base_raster_path.stem}.tif"
+    )
+
+    clipped_base_raster_path = (
+        working_dir / f"clipped_{condition_id}_{base_raster_path.stem}.tif"
+    )
+
+    flow_dir_info = geoprocessing.get_raster_info(flow_dir_raster_path)
+    base_info = geoprocessing.get_raster_info(base_raster_path)
+    geoprocessing.warp_raster(
+        base_raster_path,
+        flow_dir_info["pixel_size"],
+        clipped_base_raster_path,
+        "near",
+        target_bb=flow_dir_info["bounding_box"],
+        target_projection_wkt=flow_dir_info["projection_wkt"],
+        working_dir=working_dir,
+        output_type=base_info["datatype"],
+        vector_mask_options={
+            "mask_vector_path": aoi_vector_path,
+        },
+    )
+
+    def local_op(val):
+        expr = expression.replace("value", "val")
+        return eval(expr, {"__builtins__": {}}, {"val": val, "np": np})
+
+    geoprocessing.raster_calculator(
+        [(str(clipped_base_raster_path), 1)],
+        local_op,
+        condition_raster_path,
+        gdal.GDT_Byte,
+        None,
+    )
+
+    ds_coverage_raster_path = (
+        working_dir / f"ds_coverage_{condition_id}_{base_raster_path.stem}.tif"
+    )
+
+    routing.flow_accumulation_mfd(
+        (str(flow_dir_raster_path), 1),
+        str(ds_coverage_raster_path),
+        weight_raster_path_band=(str(condition_raster_path), 1),
+    )
+
+    def mask_op(mask, pop_val):
+        return np.where(mask > 0, pop_val, 0)
+
+    pop_info = geoprocessing.get_raster_info(clipped_pop_raster_path)
+    geoprocessing.raster_calculator(
+        [(str(ds_coverage_raster_path), 1), (str(clipped_pop_raster_path), 1)],
+        mask_op,
+        target_pop_raster_path,
+        pop_info["datatype"],
+        None,
+    )
+    return np.sum(gdal.OpenEx(target_pop_raster_path).ReadAsArray())
+
+
+def calc_flow_dir(dem_path, working_dir, target_flow_dir_raster_path):
+    pit_filled_raster_path = (
+        working_dir / f"pit_filled_{Path(dem_path).stem}.tif"
+    )
+    routing.fill_pits(
+        (dem_path, 1), pit_filled_raster_path, working_dir=working_dir
+    )
+    routing.flow_dir_mfd(
+        (str(pit_filled_raster_path), 1),
+        str(target_flow_dir_raster_path),
+        working_dir=str(working_dir),
+    )
+
+
 def main() -> None:
     """Entry point."""
     ap = argparse.ArgumentParser(
@@ -954,10 +1038,6 @@ def main() -> None:
 
     # these drive how we cut, reproject, and determine distance
     wgs84_pixel_size = config["inputs"]["wgs84_pixel_size"]
-    travel_time_pixel_size_m = config["inputs"]["travel_time_pixel_size_m"]
-    km_in_deg = wgs84_pixel_size * 1000 / travel_time_pixel_size_m
-    buffer_size_m = config["inputs"]["buffer_size_m"]
-    buffer_size_in_pixels = km_in_deg / wgs84_pixel_size * buffer_size_m
 
     good_crs_for_aoi = {}
     for aoi_key, aoi_vector_path in aoi_id_to_path.items():
@@ -970,6 +1050,7 @@ def main() -> None:
         good_crs_for_aoi[aoi_key] = crs_task
 
     section_mask_ids = set()
+    pop_results = collections.defaultdict(dict)
     for aoi_key, aoi_vector_path in aoi_id_to_path.items():
         working_dir = Path(config["work_dir"]) / Path(aoi_key)
         working_dir.mkdir(parents=True, exist_ok=True)
@@ -990,7 +1071,6 @@ def main() -> None:
         wgs84_pixel_size = config["inputs"]["wgs84_pixel_size"]
         base_raster_path_list = [
             config["inputs"]["population_raster_path"],
-            config["inputs"]["traveltime_raster_path"],
             config["inputs"]["dem_raster_path"],
         ]
         target_clipped_raster_path_list = [
@@ -998,7 +1078,8 @@ def main() -> None:
             for path in base_raster_path_list
         ]
 
-        clipped_dem_path = target_clipped_raster_path_list[2]
+        clipped_pop_raster_path = target_clipped_raster_path_list[0]
+        clipped_dem_path = target_clipped_raster_path_list[1]
 
         clip_task = task_graph.add_task(
             func=align_and_resize_raster_stack_on_vector,
@@ -1018,26 +1099,21 @@ def main() -> None:
             str(clipped_dem_path)
         )
         flow_dir_task = task_graph.add_task(
-            func=routing.flow_dir_mfd,
-            args=(
-                (clipped_dem_path, 1),
-                target_flow_dir_raster_path,
-            ),
-            kwargs={"working_dir": working_dir},
+            func=calc_flow_dir,
+            args=(clipped_dem_path, working_dir, target_flow_dir_raster_path),
             dependent_task_list=[clip_task],
             target_path_list=[target_flow_dir_raster_path],
             task_name=f"calculate flow dir for {aoi_key}",
         )
 
         for mask_section in config["masks"]:
-            section_mask_ids.add(mask_section["id"])
-            # target_mask_path = working_dir / f'{mask_section["id"]}_mask.tif'
-
+            section_id = mask_section["id"]
+            section_mask_ids.add(section_id)
+            target_pop_raster_path = (
+                output_dir / f"{aoi_key}_{mask_section['id']}.tif"
+            )
             if mask_section["type"] == "travel_time_population":
-                target_pop_raster_path = (
-                    output_dir / f"{aoi_key}_{mask_section['id']}.tif"
-                )
-                task_graph.add_task(
+                travel_task = task_graph.add_task(
                     func=apply_travel_time_mask,
                     args=(
                         config["inputs"]["traveltime_raster_path"],
@@ -1052,24 +1128,29 @@ def main() -> None:
                     target_path_list=[target_pop_raster_path],
                     task_name=f"travel time for {aoi_key}",
                 )
-
-                task_graph.join()
-                return
-
+                pop_results[aoi_key][section_id] = travel_task
             elif mask_section["type"] == "conditional_raster":
-                continue
+                task_graph.add_task(
+                    func=calculate_ds_pop_from_conditional_raster,
+                    args=(
+                        aoi_vector_path,
+                        Path(target_flow_dir_raster_path),
+                        Path(clipped_pop_raster_path),
+                        Path(mask_section["params"]["condition_raster_path"]),
+                        section_id,
+                        mask_section["params"]["expression"],
+                        working_dir,
+                        target_pop_raster_path,
+                    ),
+                    dependent_task_list=[flow_dir_task],
+                    target_path_list=[target_pop_raster_path],
+                    task_name=f"conditional downstream {section_id}",
+                )
             else:
                 raise ValueError(
                     f"unknown mask section type: {mask_section['type']}"
                 )
-            # flow_accum_task = task_graph.add_task(
-            #     func=routing.flow_accumulation_mfd,
-            #     args=((flow_dir_path, 1), aoi_downstream_flow_mask_path),
-            #     kwargs={"weight_raster_path_band": (aoi_raster_mask_path, 1)},
-            #     dependent_task_list=[flow_dir_task, rasterize_task],
-            #     target_path_list=[aoi_downstream_flow_mask_path],
-            #     task_name=f"flow accum for {analysis_id}",
-            # )
+        break
 
     task_graph.join()
     task_graph.close()
