@@ -770,6 +770,8 @@ def main() -> None:
             for path in base_raster_path_list
         ]
 
+        clipped_dem_path = target_clipped_raster_path_list[2]
+
         clip_task = task_graph.add_task(
             func=align_and_resize_raster_stack_on_vector,
             args=(
@@ -783,24 +785,24 @@ def main() -> None:
             target_path_list=target_clipped_raster_path_list,
             task_name=f"clip base data for {aoi_key}",
         )
-        clip_task.join()
+
+        target_flow_dir_raster_path = "%s_mfdflow%s" % os.path.splitext(
+            clipped_dem_path
+        )
+        flow_dir_task = task_graph.add_task(
+            func=routing.calc_flow_dir,
+            args=(
+                clipped_dem_path,
+                target_flow_dir_raster_path,
+            ),
+            kwargs={"working_dir": working_dir},
+            dependent_task_list=[clip_task],
+            target_path_list=[target_flow_dir_raster_path],
+            task_name=f"calculate flow dir for {aoi_key}",
+        )
+
+        flow_dir_task.join()
         return
-
-        flow_dir_path = working_dir / f"{aoi_key}_flow_dir.tif"
-        # flow_dir_task = task_graph.add_task(
-        #     func=calc_flow_dir,
-        #     args=(
-        #         analysis_id,
-        #         DEM_RASTER_PATH,
-        #         subset_subwatersheds_vector_path,
-        #         clipped_dem_path,
-        #         flow_dir_path,
-        #     ),
-        #     dependent_task_list=[clip_tasks["dem_raster_path"]],
-        #     target_path_list=[flow_dir_path, clipped_dem_path],
-        #     task_name=f"calculate flow dir for {analysis_id}",
-        # )
-
         for mask_section in config["sections"]["masks"]:
             target_mask_path = working_dir / f'{mask_section["id"]}_mask.tif'
             if mask_section["type"] == "travel_time_population":
