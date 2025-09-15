@@ -26,7 +26,7 @@ import yaml
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from ecoshard import geoprocessing
 from ecoshard.geoprocessing import routing
-from osgeo import gdal
+from osgeo import gdal, osr
 from shapely.geometry import box
 from shapely.geometry import shape
 from shapely.ops import transform
@@ -1023,7 +1023,7 @@ def calculate_ds_pop_from_conditional_raster(
     )
 
     def mask_op(mask, pop_val):
-        return np.where(mask > 0, pop_val, 0)
+        return np.where((mask > 0) & (pop_val > 0), pop_val, 0)
 
     pop_info = geoprocessing.get_raster_info(clipped_pop_raster_path)
     geoprocessing.raster_calculator(
@@ -1229,8 +1229,27 @@ def main() -> None:
                 result |= value_array
             return result
 
+        base_pop_raster_list = [str(path) for path in pop_rasters]
+        aligned_dir_path = working_dir / "aligned_pops"
+        aligned_dir_path.mkdir(parents=True, exist_ok=True)
+        aligned_pop_raster_list = [
+            str(aligned_dir_path / os.path.basename(path))
+            for path in base_pop_raster_list
+        ]
+        task_graph.join()
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+        wgs84_wkt = srs.ExportToWkt()
+        geoprocessing.align_and_resize_raster_stack(
+            base_pop_raster_list,
+            aligned_pop_raster_list,
+            ["near"] * len(aligned_pop_raster_list),
+            [wgs84_pixel_size, -wgs84_pixel_size],
+            "union",
+            target_projection_wkt=wgs84_wkt,
+        )
         geoprocessing.raster_calculator(
-            [(path, 1) for path in pop_rasters],
+            [(str(path), 1) for path in aligned_pop_raster_list],
             or_op,
             target_combined_pop_raster_path,
             gdal.GDT_Float32,
