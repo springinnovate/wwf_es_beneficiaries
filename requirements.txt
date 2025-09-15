@@ -6,3 +6,4 @@ psutil
 numexpr
 cython
 retrying
+PYyaml

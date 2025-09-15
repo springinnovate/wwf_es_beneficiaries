@@ -5,6 +5,10 @@ To run in docker environment:
 docker build -t therealspring/ds_beneficiaries:latest . && docker run --rm -it -v "%CD%":/usr/local/wwf_es_beneficiaries therealspring/ds_beneficiaries:latest
 - linux/mac:
 docker build -t ds_beneficiaries:latest . && docker run --rm -it -v `pwd`:/usr/local/wwf_es_beneficiaries ds_beneficiaries:latest
+
+To run the script:
+
+python workflow_runner.py ./example_roadmap2030_pop_downstream_analysis.yaml
 """
 
 from __future__ import annotations
