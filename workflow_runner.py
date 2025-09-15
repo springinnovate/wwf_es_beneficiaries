@@ -289,20 +289,34 @@ def process_config(config_path: Path) -> Dict[str, Any]:
         missing_messages.append(
             "population_raster_path (path to population raster)"
         )
+    elif not Path(population_raster_path).exists():
+        missing_messages.append(
+            f"population_raster_path does not exist: {population_raster_path}"
+        )
 
     if not traveltime_raster_path:
         missing_messages.append(
             "traveltime_raster_path (path to travel-time raster)"
         )
+    elif not Path(traveltime_raster_path).exists():
+        missing_messages.append(
+            f"traveltime_raster_path does not exist: {traveltime_raster_path}"
+        )
 
     if not dem_raster_path:
+        missing_messages.append("dem_raster_path (path to DEM raster)")
+    elif not Path(dem_raster_path).exists():
         missing_messages.append(
-            "dem_raster_path (path to subwatershed shapefile/vector)"
+            f"dem_raster_path does not exist: {dem_raster_path}"
         )
 
     if not subwatershed_vector_path:
         missing_messages.append(
             "subwatershed_vector_path (path to subwatershed shapefile/vector)"
+        )
+    elif not Path(subwatershed_vector_path).exists():
+        missing_messages.append(
+            f"subwatershed_vector_path does not exist: {subwatershed_vector_path}"
         )
 
     if not aoi_vector_pattern:
