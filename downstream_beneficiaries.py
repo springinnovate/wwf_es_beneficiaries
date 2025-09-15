@@ -62,7 +62,7 @@ GLOBAL_SUBWATERSHEDS_VECTOR_PATH = "./data/dem_precondition/merged_lev06.shp"
 DEM_RASTER_PATH = "./data/dem_precondition/astgtm_compressed.tif"
 
 AOI_DIRS = [
-    "./data/aois/All_amazon_projects"
+    "./data/aois/PFP_aois"
 ]  # "./data/aois/WWF-Int_Pilot-sites", "./data/aois/aoi_by_country"]
 
 ANALYSIS_AOIS = {}

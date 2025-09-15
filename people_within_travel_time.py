@@ -91,6 +91,30 @@ def _clamp_eckert_point(x, y):
     return x * scale, y * scale
 
 
+def transform_edge_points_eckert_to_wgs84_bounds_es_compatable(
+    bbox_gdf, dst_crs="EPSG:4326"
+):
+    if bbox_gdf.crs is None:
+        raise ValueError("bbox_gdf must have a CRS defined")
+
+    # Not Eckert IV: just reproject and return total_bounds
+    if "+proj=eck4" not in bbox_gdf.crs.to_proj4().lower():
+        gdf = bbox_gdf.to_crs(dst_crs)
+        minx, miny, maxx, maxy = gdf.total_bounds
+        return [float(minx), float(miny), float(maxx), float(maxy)]
+
+    minx, miny, maxx, maxy = bbox_gdf.total_bounds
+    raw_corners = [(minx, miny), (minx, maxy), (maxx, maxy), (maxx, miny)]
+    safe_corners = [_clamp_eckert_point(x, y) for x, y in raw_corners]
+
+    transformer = Transformer.from_crs(bbox_gdf.crs, dst_crs, always_xy=True)
+    lonlat = [transformer.transform(x, y) for x, y in safe_corners]
+    xs, ys = zip(*lonlat)
+    proj_box = box(min(xs), min(ys), max(xs), max(ys))
+    minx, miny, maxx, maxy = proj_box.bounds
+    return [float(minx), float(miny), float(maxx), float(maxy)]
+
+
 def transform_edge_points_eckert_to_wgs84(bbox_gdf, dst_crs="EPSG:4326"):
     if bbox_gdf.crs is None:
         raise ValueError("bbox_gdf must have a CRS defined")

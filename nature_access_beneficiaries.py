@@ -40,7 +40,7 @@ logging.getLogger("fiona").setLevel(logging.WARNING)
 
 
 AOI_DIRS = [
-    "./data/aois/All_amazon_projects",
+    "./data/aois/PFP_aois",
     # "./data/aois/aoi_by_country",
     # "./data/aois/WWF-Int_Pilot-sites",
 ]

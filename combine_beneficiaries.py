@@ -10,7 +10,9 @@ import sys
 from pilot_indicators_area_downstream_pop_and_es_summary import (
     align_and_resize_raster_stack,
 )
-from people_within_travel_time import transform_edge_points_eckert_to_wgs84
+from people_within_travel_time import (
+    transform_edge_points_eckert_to_wgs84_bounds_es_compatable,
+)
 from pilot_indicators_area_downstream_pop_and_es_summary import clean_it
 from pilot_indicators_area_downstream_pop_and_es_summary import (
     mask_by_nonzero_and_sum,
@@ -69,6 +71,8 @@ COMPLETE_SETS = {
     for prefix, suffix_path_dict in matched_rasters.items()
     if SUFFIXES.issubset(suffix_path_dict)
 }
+
+print(matched_rasters)
 
 INCOMPLETE_SETS = {
     prefix: suffix_path_dict.values()
@@ -191,10 +195,10 @@ def main():
                     crs=raster_path_info["projection_wkt"],
                 )
 
-                target_bb = transform_edge_points_eckert_to_wgs84(
+                target_bb = transform_edge_points_eckert_to_wgs84_bounds_es_compatable(
                     bbox_gdf
-                ).geometry.tolist()
-                print(target_bb)
+                )
+                print(f"target bb: {target_bb}")
                 warp_from_eckert_task = task_graph.add_task(
                     func=geoprocessing.warp_raster,
                     args=(
@@ -208,6 +212,7 @@ def main():
                     task_name=f"eckert_iv reprojection of {raster_path}",
                 )
                 eckert_reprojection_task_list.append(warp_from_eckert_task)
+                print(f"PATH LIST: {path_list}")
                 path_list[index] = reprojected_raster_path
 
         pop_count_task = task_graph.add_task(
