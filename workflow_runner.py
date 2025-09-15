@@ -9,6 +9,7 @@ docker build -t ds_beneficiaries:latest . && docker run --rm -it -v `pwd`:/usr/l
 
 from __future__ import annotations
 from dataclasses import dataclass
+from datetime import datetime
 import collections
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -1053,6 +1054,46 @@ def calc_flow_dir(dem_path, working_dir, target_flow_dir_raster_path):
     )
 
 
+def combine_pops(
+    pop_raster_list,
+    wgs84_pixel_size,
+    working_dir,
+    target_combined_pop_raster_path,
+):
+    def or_op(*value_list):
+        result = value_list[0]
+        for value_array in value_list[1:]:
+            result |= value_array
+        return result
+
+    base_pop_raster_list = [str(path) for path in pop_raster_list]
+    aligned_dir_path = working_dir / "aligned_pops"
+    aligned_dir_path.mkdir(parents=True, exist_ok=True)
+    aligned_pop_raster_list = [
+        str(aligned_dir_path / os.path.basename(path))
+        for path in base_pop_raster_list
+    ]
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+    wgs84_wkt = srs.ExportToWkt()
+    geoprocessing.align_and_resize_raster_stack(
+        base_pop_raster_list,
+        aligned_pop_raster_list,
+        ["near"] * len(aligned_pop_raster_list),
+        [wgs84_pixel_size, -wgs84_pixel_size],
+        "union",
+        target_projection_wkt=wgs84_wkt,
+    )
+    geoprocessing.raster_calculator(
+        [(str(path), 1) for path in aligned_pop_raster_list],
+        or_op,
+        target_combined_pop_raster_path,
+        gdal.GDT_Float32,
+        None,
+    )
+    return np.sum(gdal.OpenEx(target_combined_pop_raster_path).ReadAsArray())
+
+
 def main() -> None:
     """Entry point."""
     ap = argparse.ArgumentParser(
@@ -1184,10 +1225,7 @@ def main() -> None:
                     target_path_list=[target_pop_raster_path],
                     task_name=f"travel time for {aoi_key}",
                 )
-                pop_results[aoi_key][section_id] = (
-                    travel_task,
-                    target_pop_raster_path,
-                )
+                pop_results[aoi_key][section_id] = travel_task
                 pop_raster_tasks.append(travel_task)
             elif mask_section["type"] == "conditional_raster":
                 conditional_task = task_graph.add_task(
@@ -1206,13 +1244,11 @@ def main() -> None:
                         target_pop_raster_path,
                     ),
                     dependent_task_list=[flow_dir_task],
+                    store_result=True,
                     target_path_list=[target_pop_raster_path],
                     task_name=f"conditional downstream {section_id}",
                 )
-                pop_results[aoi_key][section_id] = (
-                    conditional_task,
-                    target_pop_raster_path,
-                )
+                pop_results[aoi_key][section_id] = conditional_task
                 pop_raster_tasks.append(conditional_task)
             else:
                 raise ValueError(
@@ -1222,41 +1258,43 @@ def main() -> None:
         target_combined_pop_raster_path = (
             output_dir / f"{aoi_key}_total_pop.tif"
         )
-
-        def or_op(*value_list):
-            result = value_list[0]
-            for value_array in value_list[1:]:
-                result |= value_array
-            return result
-
-        base_pop_raster_list = [str(path) for path in pop_rasters]
-        aligned_dir_path = working_dir / "aligned_pops"
-        aligned_dir_path.mkdir(parents=True, exist_ok=True)
-        aligned_pop_raster_list = [
-            str(aligned_dir_path / os.path.basename(path))
-            for path in base_pop_raster_list
-        ]
-        task_graph.join()
-        srs = osr.SpatialReference()
-        srs.ImportFromEPSG(4326)
-        wgs84_wkt = srs.ExportToWkt()
-        geoprocessing.align_and_resize_raster_stack(
-            base_pop_raster_list,
-            aligned_pop_raster_list,
-            ["near"] * len(aligned_pop_raster_list),
-            [wgs84_pixel_size, -wgs84_pixel_size],
-            "union",
-            target_projection_wkt=wgs84_wkt,
+        combined_task = task_graph.add_task(
+            func=combine_pops,
+            args=(
+                pop_rasters,
+                wgs84_pixel_size,
+                working_dir,
+                target_combined_pop_raster_path,
+            ),
+            dependent_task_list=pop_raster_tasks,
+            store_result=True,
+            target_path_list=[target_combined_pop_raster_path],
+            task_name=f"combined pop for {aoi_key}",
         )
-        geoprocessing.raster_calculator(
-            [(str(path), 1) for path in aligned_pop_raster_list],
-            or_op,
-            target_combined_pop_raster_path,
-            gdal.GDT_Float32,
-            None,
-        )
+        combined_header = "combined pop"
+        section_mask_ids.add(combined_header)
+        pop_results[aoi_key][combined_header] = combined_task
         break
 
+    rows = []
+    for aoi_key, results in pop_results.items():
+        row = {"aoi": aoi_key}
+        for header in section_mask_ids:
+            row[header] = results.get(header, "n/a").get()
+        rows.append(row)
+
+    df = pd.DataFrame(rows, columns=["aoi"] + list(section_mask_ids))
+    cols = (
+        ["aoi"]
+        + [c for c in df.columns if c not in ("aoi", "combined pop")]
+        + ["combined pop"]
+    )
+    df = df[cols]
+    csv_path = (
+        output_dir
+        / f'{config["run_name"]}_{datetime.now().strftime("%Y_%m_%d_%H_%M_%S")}.csv'
+    )
+    df.to_csv(csv_path, index=False)
     task_graph.join()
     task_graph.close()
 
