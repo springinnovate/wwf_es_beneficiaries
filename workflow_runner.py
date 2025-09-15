@@ -1159,12 +1159,15 @@ def main() -> None:
             task_name=f"calculate flow dir for {aoi_key}",
         )
 
+        pop_rasters = []
+        pop_raster_tasks = []
         for mask_section in config["masks"]:
             section_id = mask_section["id"]
             section_mask_ids.add(section_id)
             target_pop_raster_path = (
-                output_dir / f"{aoi_key}_{mask_section['id']}.tif"
+                output_dir / f"{aoi_key}_{mask_section['id']}_pop.tif"
             )
+            pop_rasters.append(target_pop_raster_path)
             if mask_section["type"] == "travel_time_population":
                 travel_task = task_graph.add_task(
                     func=apply_travel_time_mask,
@@ -1181,9 +1184,13 @@ def main() -> None:
                     target_path_list=[target_pop_raster_path],
                     task_name=f"travel time for {aoi_key}",
                 )
-                pop_results[aoi_key][section_id] = travel_task
+                pop_results[aoi_key][section_id] = (
+                    travel_task,
+                    target_pop_raster_path,
+                )
+                pop_raster_tasks.append(travel_task)
             elif mask_section["type"] == "conditional_raster":
-                task_graph.add_task(
+                conditional_task = task_graph.add_task(
                     func=calculate_ds_pop_from_conditional_raster,
                     args=(
                         aoi_vector_path,
@@ -1202,10 +1209,33 @@ def main() -> None:
                     target_path_list=[target_pop_raster_path],
                     task_name=f"conditional downstream {section_id}",
                 )
+                pop_results[aoi_key][section_id] = (
+                    conditional_task,
+                    target_pop_raster_path,
+                )
+                pop_raster_tasks.append(conditional_task)
             else:
                 raise ValueError(
                     f"unknown mask section type: {mask_section['type']}"
                 )
+        task_graph.join()
+        target_combined_pop_raster_path = (
+            output_dir / f"{aoi_key}_total_pop.tif"
+        )
+
+        def or_op(*value_list):
+            result = value_list[0]
+            for value_array in value_list[1:]:
+                result |= value_array
+            return result
+
+        geoprocessing.raster_calculator(
+            [(path, 1) for path in pop_rasters],
+            or_op,
+            target_combined_pop_raster_path,
+            gdal.GDT_Float32,
+            None,
+        )
         break
 
     task_graph.join()
