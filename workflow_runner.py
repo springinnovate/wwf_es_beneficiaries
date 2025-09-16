@@ -47,6 +47,8 @@ from pyproj import CRS, Transformer, Geod
 
 import shortest_distances
 
+logging.getLogger("rasterio").setLevel(logging.WARNING)
+
 
 @dataclass
 class PickedCRS:
@@ -193,8 +195,7 @@ def choose_equidistant_crs_from_bbox(aoi_vector_path: str) -> PickedCRS:
     return PickedCRS(
         crs=crs,
         rationale=(
-            f"Azimuthal Equidistant fallback - "
-            f"large N–S extent {ns_km:.0f} km"
+            f"Azimuthal Equidistant fallback - " f"large N–S extent {ns_km:.0f} km"
         ),
     )
 
@@ -286,32 +287,24 @@ def process_config(config_path: Path) -> Dict[str, Any]:
 
     missing_messages = []
     if not population_raster_path:
-        missing_messages.append(
-            "population_raster_path (path to population raster)"
-        )
+        missing_messages.append("population_raster_path (path to population raster)")
     elif not Path(population_raster_path).exists():
         missing_messages.append(
             f"population_raster_path does not exist: {population_raster_path}"
         )
 
     if not traveltime_raster_path:
-        missing_messages.append(
-            "traveltime_raster_path (path to travel-time raster)"
-        )
+        missing_messages.append("traveltime_raster_path (path to travel-time raster)")
     elif not Path(traveltime_raster_path).exists():
         missing_messages.append(
             f"traveltime_raster_path does not exist: {traveltime_raster_path}"
         )
-        missing_messages.append(
-            "population_raster_path (path to population raster)"
-        )
+        missing_messages.append("population_raster_path (path to population raster)")
 
     if not dem_raster_path:
         missing_messages.append("dem_raster_path (path to DEM raster)")
     elif not Path(dem_raster_path).exists():
-        missing_messages.append(
-            f"dem_raster_path does not exist: {dem_raster_path}"
-        )
+        missing_messages.append(f"dem_raster_path does not exist: {dem_raster_path}")
 
     if not subwatershed_vector_path:
         missing_messages.append(
@@ -323,9 +316,7 @@ def process_config(config_path: Path) -> Dict[str, Any]:
         )
 
     if not aoi_vector_pattern:
-        missing_messages.append(
-            "aoi_vector_pattern (one or more AOI file patterns)"
-        )
+        missing_messages.append("aoi_vector_pattern (one or more AOI file patterns)")
 
     if wgs84_pixel_size is None:
         missing_messages.append(
@@ -343,9 +334,7 @@ def process_config(config_path: Path) -> Dict[str, Any]:
         )
 
     if missing_messages:
-        msg = "Missing required input(s):\n  - " + "\n  - ".join(
-            missing_messages
-        )
+        msg = "Missing required input(s):\n  - " + "\n  - ".join(missing_messages)
         raise ValueError(msg)
 
     sections = raw_yaml.get("sections", []) or []
@@ -394,13 +383,11 @@ def process_config(config_path: Path) -> Dict[str, Any]:
 
         if not matched:
             errors.append(
-                f"sections[{idx}] must contain at least one of "
-                f'["masks", "combine"]'
+                f"sections[{idx}] must contain at least one of " f'["masks", "combine"]'
             )
     if len(found_sections) != 2:
         raise ValueError(
-            "Expected both a `masks` and `combine` section but missing at "
-            "least one."
+            "Expected both a `masks` and `combine` section but missing at " "least one."
         )
 
     if errors:
@@ -457,9 +444,7 @@ def setup_logger(level: str, log_file: str) -> logging.Logger:
 
     # stdout handler
     sh = logging.StreamHandler(sys.stdout)
-    format_str = (
-        "%(asctime)s %(filename)s:%(lineno)d [%(levelname)s]  %(message)s"
-    )
+    format_str = "%(asctime)s %(filename)s:%(lineno)d [%(levelname)s]  %(message)s"
     sh.setFormatter(logging.Formatter(format_str))
     logger.addHandler(sh)
 
@@ -663,9 +648,7 @@ def subset_subwatersheds(
 
     hits = sub_bbox_gdf.sindex.query(aoi_union, predicate="intersects")
     if len(hits) == 0:
-        raise ValueError(
-            f"No intersecting sub-watersheds for {aoi_vector_path}."
-        )
+        raise ValueError(f"No intersecting sub-watersheds for {aoi_vector_path}.")
 
     initial = sub_bbox_gdf.iloc[hits]
     initial_ids = set(initial["HYBAS_ID"].tolist())
@@ -713,9 +696,9 @@ def subset_subwatersheds(
                 invalid, "geometry"
             ].make_valid()
         else:
-            sub_gdf.loc[invalid, "geometry"] = sub_gdf.loc[
-                invalid, "geometry"
-            ].buffer(0)
+            sub_gdf.loc[invalid, "geometry"] = sub_gdf.loc[invalid, "geometry"].buffer(
+                0
+            )
 
     # Reproject to AOI CRS and write
     if sub_crs and aoi_crs and sub_crs != aoi_crs:
@@ -794,9 +777,7 @@ def _clip_and_reproject_raster(
             raise ValueError("bbox_gdf must have a CRS defined")
 
         if "+proj=eck4" in bbox_gdf.crs.to_proj4().lower():
-            logger.info(
-                "eckert is so broken, just doing regular lat/lng bounds"
-            )
+            logger.info("eckert is so broken, just doing regular lat/lng bounds")
             projected_box_gdf = transform_edge_points_eckert_to_wgs84(bbox_gdf)
             projected_box_gdf = gpd.GeoDataFrame(
                 geometry=[box(-179, -80, 179, 80)], crs="EPSG:4326"
@@ -878,9 +859,7 @@ def apply_travel_time_mask(
     aoi_vector = gpd.read_file(aoi_vector_path)
     projected_gdf = aoi_vector.to_crs(target_crs)
     bbox = projected_gdf.total_bounds
-    buffer_distance_m = (
-        max_hours * 104 * 1000
-    )  # drive 65mph for that many hours
+    buffer_distance_m = max_hours * 104 * 1000  # drive 65mph for that many hours
 
     buffered_bbox = box(
         bbox[0] - buffer_distance_m,
@@ -890,9 +869,7 @@ def apply_travel_time_mask(
     )
 
     logger.info(f"buffered box: {buffered_bbox}")
-    bbox_gdf = gpd.GeoDataFrame(
-        {"geometry": [buffered_bbox]}, crs=projected_gdf.crs
-    )
+    bbox_gdf = gpd.GeoDataFrame({"geometry": [buffered_bbox]}, crs=projected_gdf.crs)
 
     target_pop_clipped_raster_path = Path(
         working_dir / f"{traveltime_raster_path.stem}_travel_clip.tif"
@@ -947,13 +924,9 @@ def apply_travel_time_mask(
         friction_array, mask_array, cell_length_m, n_cols, n_rows, max_time_mins
     )
 
-    target_max_reach_raster_path = (
-        working_dir / f"max_reach_{max_time_mins}min.tif"
-    )
+    target_max_reach_raster_path = working_dir / f"max_reach_{max_time_mins}min.tif"
 
-    with rasterio.open(
-        target_max_reach_raster_path, "w", **aoi_meta
-    ) as max_reach:
+    with rasterio.open(target_max_reach_raster_path, "w", **aoi_meta) as max_reach:
         max_reach.write(travel_reach_array, 1)
 
     pop_meta = ref_meta.copy()
@@ -1027,9 +1000,7 @@ def calculate_ds_pop_from_conditional_raster(
         weight_raster_path_band=(str(condition_raster_path), 1),
     )
 
-    buffer_amounts_in_pixels = int(
-        np.round(buffer_size_m / travel_time_pixel_size_m)
-    )
+    buffer_amounts_in_pixels = int(np.round(buffer_size_m / travel_time_pixel_size_m))
 
     kernel_path = str(working_dir / f"{buffer_amounts_in_pixels}_kernel.tif")
     create_circular_kernel(kernel_path, buffer_amounts_in_pixels)
@@ -1061,12 +1032,8 @@ def calculate_ds_pop_from_conditional_raster(
 
 
 def calc_flow_dir(dem_path, working_dir, target_flow_dir_raster_path):
-    pit_filled_raster_path = (
-        working_dir / f"pit_filled_{Path(dem_path).stem}.tif"
-    )
-    routing.fill_pits(
-        (dem_path, 1), pit_filled_raster_path, working_dir=working_dir
-    )
+    pit_filled_raster_path = working_dir / f"pit_filled_{Path(dem_path).stem}.tif"
+    routing.fill_pits((dem_path, 1), pit_filled_raster_path, working_dir=working_dir)
     routing.flow_dir_mfd(
         (str(pit_filled_raster_path), 1),
         str(target_flow_dir_raster_path),
@@ -1090,8 +1057,7 @@ def combine_pops(
     aligned_dir_path = working_dir / "aligned_pops"
     aligned_dir_path.mkdir(parents=True, exist_ok=True)
     aligned_pop_raster_list = [
-        str(aligned_dir_path / os.path.basename(path))
-        for path in base_pop_raster_list
+        str(aligned_dir_path / os.path.basename(path)) for path in base_pop_raster_list
     ]
     srs = osr.SpatialReference()
     srs.ImportFromEPSG(4326)
@@ -1133,9 +1099,7 @@ def main() -> None:
     config = process_config(args.config)
     output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
-    logger = setup_logger(
-        config["logging"]["level"], config["logging"]["to_file"]
-    )
+    logger = setup_logger(config["logging"]["level"], config["logging"]["to_file"])
 
     validate_paths(config)
     logger.info(f"{args.config} read successfully")
@@ -1271,13 +1235,10 @@ def main() -> None:
                 pop_results[aoi_key][section_id] = conditional_task
                 pop_raster_tasks.append(conditional_task)
             else:
-                raise ValueError(
-                    f"unknown mask section type: {mask_section['type']}"
-                )
+                raise ValueError(f"unknown mask section type: {mask_section['type']}")
+        target_combined_pop_raster_path = output_dir / f"{aoi_key}_total_pop.tif"
         task_graph.join()
-        target_combined_pop_raster_path = (
-            output_dir / f"{aoi_key}_total_pop.tif"
-        )
+        target_combined_pop_raster_path = output_dir / f"{aoi_key}_total_pop.tif"
         combined_task = task_graph.add_task(
             func=combine_pops,
             args=(
@@ -1296,7 +1257,6 @@ def main() -> None:
         pop_results[aoi_key][combined_header] = combined_task
 
     task_graph.join()
-
     rows = []
     for aoi_key, results in pop_results.items():
         row = {"aoi": aoi_key}

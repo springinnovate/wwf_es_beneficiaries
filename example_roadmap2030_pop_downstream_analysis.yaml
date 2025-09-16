@@ -7,14 +7,13 @@ inputs:
   wgs84_pixel_size: 0.008333333333333
   travel_time_pixel_size_m: 900
   buffer_size_m: 5000
-  population_raster_path: "./Data for analyses/pop_rasters/landscan-global-2023.tif"
-  traveltime_raster_path: "./Data for analyses/travel_time/friction_surface_2019_compressed_md5_1be7dd230178a5d395529be7a5e3fb0a.tif"
-  dem_raster_path: "./Data for analyses/dem_precondition/astgtm_compressed.tif"
-  subwatershed_vector_path: "./Data for analyses/dem_precondition/merged_lev06.shp"
+  population_raster_path: "./data/pop_rasters/landscan-global-2023.tif"
+  traveltime_raster_path: "./data/travel_time/friction_surface_2019_compressed_md5_1be7dd230178a5d395529be7a5e3fb0a.tif"
+  dem_raster_path: "./data/dem_precondition/astgtm_compressed.tif"
+  subwatershed_vector_path: "./data/dem_precondition/merged_lev06.shp"
   aoi_vector_pattern:
-    - "./Data for analyses/aois/aoi_by_country/*.gpkg"
-    - "./Data for analyses/aois/WWF_Int_Pilot-sites/*.shp"
-    - "./Data for analyses/aois/WWF_Int_Pilot-sites/*/*.shp"
+    - "./data/aois/aoi_by_country/*.gpkg"
+    - "./data/aois/WWF-Int_Pilot-sites/*/*.shp"
 
 sections:
   - masks:
@@ -25,16 +24,16 @@ sections:
     - id: n_export_mask
       type: conditional_raster
       params:
-        condition_raster_path: "./Data for analyses/es_change_rasters/n_export_tnc_2020-1992_change_val_md5_18a2b3.tif"
+        condition_raster_path: "./data/es_change_rasters/n_export_tnc_2020-1992_change_val_md5_18a2b3.tif"
         expression: 'value > 0'
     - id: sed_export_mask
       type: conditional_raster
       params:
-        condition_raster_path: "./Data for analyses/es_change_rasters/sed_export_tnc_ESA_2020-1992_change_md5_0ab0cf.tif"
+        condition_raster_path: "./data/es_change_rasters/sed_export_tnc_ESA_2020-1992_change_md5_0ab0cf.tif"
         expression: 'value > 0'
   - combine:
     - logic: OR
 
 logging:
-  level: WARNING
+  level: INFO
   to_file: output.log
