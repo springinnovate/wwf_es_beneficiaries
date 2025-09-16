@@ -288,18 +288,31 @@ def process_config(config_path: Path) -> Dict[str, Any]:
     missing_messages = []
     if not population_raster_path:
         missing_messages.append("population_raster_path (path to population raster)")
+    elif not Path(population_raster_path).exists():
+        missing_messages.append(
+            f"population_raster_path does not exist: {population_raster_path}"
+        )
 
     if not traveltime_raster_path:
         missing_messages.append("traveltime_raster_path (path to travel-time raster)")
+    elif not Path(traveltime_raster_path).exists():
+        missing_messages.append(
+            f"traveltime_raster_path does not exist: {traveltime_raster_path}"
+        )
+        missing_messages.append("population_raster_path (path to population raster)")
 
     if not dem_raster_path:
-        missing_messages.append(
-            "dem_raster_path (path to subwatershed shapefile/vector)"
-        )
+        missing_messages.append("dem_raster_path (path to DEM raster)")
+    elif not Path(dem_raster_path).exists():
+        missing_messages.append(f"dem_raster_path does not exist: {dem_raster_path}")
 
     if not subwatershed_vector_path:
         missing_messages.append(
             "subwatershed_vector_path (path to subwatershed shapefile/vector)"
+        )
+    elif not Path(subwatershed_vector_path).exists():
+        missing_messages.append(
+            f"subwatershed_vector_path does not exist: {subwatershed_vector_path}"
         )
 
     if not aoi_vector_pattern:
@@ -1223,6 +1236,8 @@ def main() -> None:
                 pop_raster_tasks.append(conditional_task)
             else:
                 raise ValueError(f"unknown mask section type: {mask_section['type']}")
+        target_combined_pop_raster_path = output_dir / f"{aoi_key}_total_pop.tif"
+        task_graph.join()
         target_combined_pop_raster_path = output_dir / f"{aoi_key}_total_pop.tif"
         combined_task = task_graph.add_task(
             func=combine_pops,
