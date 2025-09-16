@@ -540,9 +540,7 @@ def collect_aoi_files(config: dict) -> dict[str, Path]:
 
     aoi_map: dict[str, Path] = {}
     for pattern in patterns:
-        print(pattern)
         for p in glob.glob(pattern):
-            print(p)
             path = Path(p).resolve()
             stem = path.stem
             if stem in aoi_map:
