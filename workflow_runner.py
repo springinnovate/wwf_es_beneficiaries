@@ -47,6 +47,8 @@ from pyproj import CRS, Transformer, Geod
 
 import shortest_distances
 
+logging.getLogger("rasterio").setLevel(logging.WARNING)
+
 
 @dataclass
 class PickedCRS:
@@ -538,7 +540,9 @@ def collect_aoi_files(config: dict) -> dict[str, Path]:
 
     aoi_map: dict[str, Path] = {}
     for pattern in patterns:
+        print(pattern)
         for p in glob.glob(pattern):
+            print(p)
             path = Path(p).resolve()
             stem = path.stem
             if stem in aoi_map:
@@ -1221,7 +1225,6 @@ def main() -> None:
                 pop_raster_tasks.append(conditional_task)
             else:
                 raise ValueError(f"unknown mask section type: {mask_section['type']}")
-        task_graph.join()
         target_combined_pop_raster_path = output_dir / f"{aoi_key}_total_pop.tif"
         combined_task = task_graph.add_task(
             func=combine_pops,
@@ -1241,7 +1244,6 @@ def main() -> None:
         pop_results[aoi_key][combined_header] = combined_task
 
     task_graph.join()
-
     rows = []
     for aoi_key, results in pop_results.items():
         row = {"aoi": aoi_key}

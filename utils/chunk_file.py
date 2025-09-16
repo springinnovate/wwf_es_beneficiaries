@@ -1,17 +1,20 @@
-"""Cut a file into pieces then reassemble it later."""
+"""Cut a file into pieces (zipped in parallel) then reassemble it later."""
 
 import argparse
 import hashlib
 import json
 import math
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, List, Tuple
+from typing import Dict, Iterator, List, Tuple
 import zipfile
 
 from tqdm import tqdm as _tqdm
 
 DEFAULT_CHUNK_SIZE = 64 * 1024 * 1024  # 64 MiB
+DEFAULT_WORKERS = max(1, os.cpu_count() or 1)
 
 
 def _pbar(total: int, desc: str):
@@ -43,28 +46,65 @@ def sha256_file(path: Path, bufsize: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
-def read_in_chunks(f, chunk_size: int) -> Iterator[bytes]:
-    while True:
-        data = f.read(chunk_size)
-        if not data:
-            break
-        yield data
-
-
 def _zip_compress_type() -> int:
-    # Use deflate when available; fall back to stored
     try:
         return zipfile.ZIP_DEFLATED
     except Exception:
         return zipfile.ZIP_STORED
 
 
+def _zip_chunk_worker(args: Tuple[Path, int, int, int, Path, str, int]) -> Dict:
+    src, offset, size, idx, outdir, prefix, comp_type = args
+    zip_name = f"{prefix}.part{idx:06d}.zip"
+    member_name = f"{prefix}.part{idx:06d}.bin"
+    zip_path = outdir / zip_name
+
+    h = hashlib.sha256()
+    with src.open("rb") as f:
+        f.seek(offset)
+        remaining = size
+        # write to zip incrementally to avoid large memory spikes
+        with zipfile.ZipFile(zip_path, "w", compression=comp_type) as zf:
+            info = zipfile.ZipInfo(
+                member_name, date_time=datetime.now().timetuple()[:6]
+            )
+            info.compress_type = comp_type
+            # use a temporary file-like to stream writes
+            # ZipFile has no streaming API for unknown sizes with deflate except writestr (which takes full bytes).
+            # So read into memory in safe chunked manner, then writestr once.
+            # For very large chunks, fall back to a temp file path.
+            # Simple approach: read into bytes (kept as size <= chunk_size).
+            data = bytearray()
+            read_size = 1024 * 1024
+            while remaining > 0:
+                chunk = f.read(min(read_size, remaining))
+                if not chunk:
+                    break
+                data.extend(chunk)
+                h.update(chunk)
+                remaining -= len(chunk)
+            zf.writestr(info, bytes(data))
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        comp_size = zf.getinfo(member_name).compress_size
+
+    return {
+        "zip_filename": zip_name,
+        "member_name": member_name,
+        "raw_size": size,
+        "compressed_size": comp_size,
+        "raw_sha256": h.hexdigest(),
+        "bytes_done": size,
+        "idx": idx,
+    }
+
+
 def split_file(
     src: Path,
     outdir: Path,
     chunk_size: int,
-    prefix: str,
-    manifest_name: str,
+    prefix: str | None,
+    manifest_name: str | None,
+    workers: int,
 ) -> Path:
     src = src.resolve()
     outdir.mkdir(parents=True, exist_ok=True)
@@ -72,16 +112,15 @@ def split_file(
         prefix = src.stem
     if manifest_name is None:
         manifest_name = f"{prefix}.manifest.json"
+    workers = max(1, int(workers))
 
     total_size = src.stat().st_size
     total_parts = math.ceil(total_size / chunk_size) if total_size else 1
-    parts: List[
-        Tuple[str, str, int, int, str]
-    ] = []  # (zip_filename, member_name, raw_size, comp_size, raw_sha256)
     comp_type = _zip_compress_type()
 
+    parts: List[Dict] = []
+
     if total_size == 0:
-        # create a single empty zip chunk
         zip_name = f"{prefix}.part000001.zip"
         member_name = f"{prefix}.part000001.bin"
         zip_path = outdir / zip_name
@@ -94,31 +133,41 @@ def split_file(
         with zipfile.ZipFile(zip_path, "r") as zf:
             comp_size = zf.getinfo(member_name).compress_size
         parts.append(
-            (
-                zip_name,
-                member_name,
-                0,
-                comp_size,
-                hashlib.sha256(b"").hexdigest(),
-            )
+            {
+                "zip_filename": zip_name,
+                "member_name": member_name,
+                "raw_size": 0,
+                "compressed_size": comp_size,
+                "raw_sha256": hashlib.sha256(b"").hexdigest(),
+            }
         )
     else:
-        with src.open("rb") as f, _pbar(total_size, "Splitting (zip)") as pbar:
-            for idx, data in enumerate(read_in_chunks(f, chunk_size), start=1):
-                raw_sha = hashlib.sha256(data).hexdigest()
-                zip_name = f"{prefix}.part{idx:06d}.zip"
-                member_name = f"{prefix}.part{idx:06d}.bin"
-                zip_path = outdir / zip_name
-                with zipfile.ZipFile(zip_path, "w", compression=comp_type) as zf:
-                    info = zipfile.ZipInfo(
-                        member_name, date_time=datetime.now().timetuple()[:6]
-                    )
-                    info.compress_type = comp_type
-                    zf.writestr(info, data)
-                with zipfile.ZipFile(zip_path, "r") as zf:
-                    comp_size = zf.getinfo(member_name).compress_size
-                parts.append((zip_name, member_name, len(data), comp_size, raw_sha))
-                pbar.update(len(data))
+        # build work items as (src, offset, size, idx, outdir, prefix, comp_type)
+        work: List[Tuple[Path, int, int, int, Path, str, int]] = []
+        for idx in range(1, total_parts + 1):
+            offset = (idx - 1) * chunk_size
+            size = min(chunk_size, total_size - offset)
+            work.append((src, offset, size, idx, outdir, prefix, comp_type))
+
+        with _pbar(total_size, "Splitting (zip, parallel)") as pbar:
+            if workers == 1:
+                for args in work:
+                    res = _zip_chunk_worker(args)
+                    parts.append(res)
+                    pbar.update(res["bytes_done"])
+            else:
+                with ProcessPoolExecutor(max_workers=workers) as ex:
+                    futures = [ex.submit(_zip_chunk_worker, args) for args in work]
+                    for fut in as_completed(futures):
+                        res = fut.result()
+                        parts.append(res)
+                        pbar.update(res["bytes_done"])
+
+        # ensure parts are ordered by idx
+        parts.sort(key=lambda d: d["idx"])
+        for d in parts:
+            d.pop("bytes_done", None)
+            d.pop("idx", None)
 
     src_hash = sha256_file(src) if total_size else hashlib.sha256(b"").hexdigest()
 
@@ -133,16 +182,7 @@ def split_file(
         "zip_compression": (
             "DEFLATED" if comp_type == zipfile.ZIP_DEFLATED else "STORED"
         ),
-        "parts": [
-            {
-                "zip_filename": zf,
-                "member_name": mem,
-                "raw_size": rsz,
-                "compressed_size": csz,
-                "raw_sha256": rsha,
-            }
-            for (zf, mem, rsz, csz, rsha) in parts
-        ],
+        "parts": parts,
     }
 
     manifest_path = outdir / manifest_name
@@ -153,7 +193,7 @@ def split_file(
 
 def join_file(
     manifest_path: Path,
-    out_path: Path,
+    out_path: Path | None,
     verify_hashes: bool,
     bufsize: int = 1024 * 1024,
 ) -> Path:
@@ -220,7 +260,7 @@ def join_file(
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="filechunker",
-        description="Split a large file into zipped chunks and reassemble later.",
+        description="Split a large file into zipped chunks (parallel) and reassemble later.",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -238,6 +278,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="override manifest filename",
+    )
+    sp.add_argument(
+        "--n_workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help="number of parallel processes",
     )
 
     jp = sub.add_parser("join", help="join zipped parts using a manifest")
@@ -260,6 +306,7 @@ def main() -> None:
             chunk_size=chunk_size,
             prefix=args.prefix,
             manifest_name=args.manifest_name,
+            workers=args.n_workers,
         )
         print(str(manifest_path))
     elif args.cmd == "join":
