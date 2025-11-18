@@ -45,8 +45,8 @@ RUN micromamba run -n base pip install -r /tmp/requirements.txt
 
 RUN git clone https://github.com/springinnovate/ecoshard.git /usr/local/ecoshard && \
     cd /usr/local/ecoshard && \
-    micromamba run -n base pip install . && \
-    git log -1 --format="%h on %ci" > /usr/local/ecoshard.gitversion
+    micromamba run -n base pip install --no-build-isolation . && \
+    git log -1 --format='%h on %ci' > /usr/local/ecoshard.gitversion
 
 RUN useradd -ms /bin/bash user && chown -R user:user ${WORKDIR} /usr/local/ecoshard /usr/local/shortest_distances
 USER user
