@@ -978,13 +978,34 @@ def calculate_ds_pop_from_conditional_raster(
         },
     )
 
-    def local_op(val):
-        expr = expression.replace("value", "val")
-        return eval(expr, {"__builtins__": {}}, {"val": val, "np": np})
+    base_raster_nodata = geoprocessing.get_raster_info(base_raster_path)["nodata"][0]
+
+    def _local_op(value):
+        """Applies an elementwise expression to an array with nodata masking.
+
+        Note: `base_raster_nodata` and `expression` are provided in the outside
+            closure.
+
+        Args:
+            value (np.ndarray): Input array.
+
+        Returns:
+            np.ndarray: Array with the expression applied to valid elements.
+        """
+        result = value.copy()
+        valid_mask = (
+            slice(None) if base_raster_nodata is None else value != base_raster_nodata
+        )
+        result[valid_mask] = eval(
+            expression,
+            {"__builtins__": {}},
+            {"value": value[valid_mask], "np": np},
+        )
+        return result
 
     geoprocessing.raster_calculator(
         [(str(clipped_base_raster_path), 1)],
-        local_op,
+        _local_op,
         condition_raster_path,
         gdal.GDT_Byte,
         None,
