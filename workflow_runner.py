@@ -450,21 +450,21 @@ def setup_logger(level: str, log_file: str) -> logging.Logger:
     Returns:
         logging.Logger: Configured logger instance.
     """
-    root = logging.getLogger()
-    root.setLevel(level.upper())
-    root.handlers.clear()
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level.upper())
+    root_logger.handlers.clear()
 
     fmt = "%(asctime)s %(filename)s:%(lineno)d [%(levelname)s]  %(message)s"
 
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(logging.Formatter(fmt))
-    root.addHandler(sh)
+    root_logger.addHandler(sh)
 
     fh = logging.FileHandler(log_file, mode="w", encoding="utf-8")
     fh.setFormatter(logging.Formatter(fmt))
-    root.addHandler(fh)
+    root_logger.addHandler(fh)
 
-    return root
+    return root_logger
 
 
 def validate_paths(config: Dict[str, Any]) -> None:
