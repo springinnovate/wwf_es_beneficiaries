@@ -968,7 +968,25 @@ def apply_travel_time_mask(
 def create_distance_transform(
     base_mask_raster_path, target_distance_transform_path
 ):
+    """Create a distance-transform raster from a binary mask.
 
+    This function computes a distance transform on a binary mask raster using
+    ``gdal.ComputeProximity``. Distances are computed in pixel units from all
+    pixels whose value is exactly ``1`` in the input raster. The resulting
+    distance raster is written as a tiled, compressed GeoTIFF that inherits
+    the geotransform and projection from the source mask.
+
+    Args:
+        base_mask_raster_path: Path-like to a single-band raster containing a
+            binary mask. Pixels with value ``1`` are treated as source pixels
+            for the distance transform; all other values are treated as
+            non-source.
+        target_distance_transform_path: Path-like specifying where the
+            output distance-transform GeoTIFF should be written.
+
+    Returns:
+        None
+    """
     base_raster = gdal.Open(base_mask_raster_path)
     src_band = base_raster.GetRasterBand(1)
 
@@ -1015,6 +1033,51 @@ def calculate_ds_pop_from_conditional_raster(
     working_dir,
     target_pop_raster_path,
 ):
+    """Calculate downstream population satisfying a conditional raster expression.
+
+    This function evaluates a user-provided expression on a base raster to
+    create a binary condition mask, routes that mask downstream using
+    multiple-flow-direction accumulation, optionally buffers and truncates it
+    by a maximum downstream distance, and then applies the resulting coverage
+    mask to a population raster. The masked population raster is written to
+    disk and its total population is returned.
+
+    Intermediate rasters (condition mask, clipped base, downstream coverage,
+    buffer kernel, distance transform, and optionally distance-limited
+    coverage) are created in ``working_dir`` with filenames derived from
+    ``condition_id`` and ``base_raster_path``.
+
+    Args:
+        aoi_vector_path: Path-like to a vector dataset defining the analysis
+            area of interest. Used to mask the warped base raster.
+        flow_dir_raster_path: Path-like to a flow-direction raster used as
+            input to ``routing.flow_accumulation_mfd``.
+        clipped_pop_raster_path: Path-like to a population raster already
+            aligned and clipped to the flow-direction grid.
+        base_raster_path: Path-like to the base raster on which
+            ``expression`` is evaluated to derive the condition mask.
+        condition_id: Identifier (string or value convertible to string) used
+            to differentiate intermediate filenames for this condition.
+        expression: String containing a Python expression evaluated with
+            ``value`` (a NumPy array of base raster values) and ``np``
+            (NumPy). Nonzero results define the condition mask.
+        buffer_size_m: Circular buffer radius in meters used to convolve the
+            downstream coverage raster.
+        max_downstream_distance_m: Optional maximum downstream distance in
+            meters. If not ``None``, a distance transform is used to zero out
+            coverage beyond this distance.
+        travel_time_pixel_size_m: Pixel size in meters used to convert the
+            distance-transform pixel counts to meters when applying
+            ``max_downstream_distance_m``.
+        working_dir: Path-like directory where all intermediate rasters and
+            kernels will be written.
+        target_pop_raster_path: Path-like where the final masked population
+            raster will be written.
+
+    Returns:
+        float: Sum of the population values in ``target_pop_raster_path``
+        after applying the downstream coverage and optional distance limit.
+    """
     logger = logging.getLogger(__name__)
     logger.info(f"max downstream distance: {max_downstream_distance_m}")
     condition_raster_path = (
