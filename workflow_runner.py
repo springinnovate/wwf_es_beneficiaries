@@ -965,6 +965,61 @@ def apply_travel_time_mask(
     return np.sum(pop_masked_array)
 
 
+def create_distance_transform(
+    base_mask_raster_path, target_distance_transform_path
+):
+    """Create a distance-transform raster from a binary mask.
+
+    This function computes a distance transform on a binary mask raster using
+    ``gdal.ComputeProximity``. Distances are computed in pixel units from all
+    pixels whose value is exactly ``1`` in the input raster. The resulting
+    distance raster is written as a tiled, compressed GeoTIFF that inherits
+    the geotransform and projection from the source mask.
+
+    Args:
+        base_mask_raster_path: Path-like to a single-band raster containing a
+            binary mask. Pixels with value ``1`` are treated as source pixels
+            for the distance transform; all other values are treated as
+            non-source.
+        target_distance_transform_path: Path-like specifying where the
+            output distance-transform GeoTIFF should be written.
+
+    Returns:
+        None
+    """
+    base_raster = gdal.Open(base_mask_raster_path)
+    src_band = base_raster.GetRasterBand(1)
+
+    driver = gdal.GetDriverByName("GTiff")
+    target_raster = driver.Create(
+        target_distance_transform_path,
+        base_raster.RasterXSize,
+        base_raster.RasterYSize,
+        1,
+        gdal.GDT_Float32,
+        [
+            "TILED=YES",
+            "BIGTIFF=YES",
+            "COMPRESS=LZW",
+            "BLOCKXSIZE=256",
+            "BLOCKYSIZE=256",
+            "NUM_THREADS=ALL_CPUS",
+        ],
+    )
+
+    target_raster.SetGeoTransform(base_raster.GetGeoTransform())
+    target_raster.SetProjection(base_raster.GetProjection())
+
+    gdal.ComputeProximity(
+        src_band,
+        target_raster.GetRasterBand(1),
+        ["VALUES=1", "DISTUNITS=PIXEL"],
+    )
+
+    target_raster = None
+    base_raster = None
+
+
 def calculate_ds_pop_from_conditional_raster(
     aoi_vector_path,
     flow_dir_raster_path,
@@ -973,17 +1028,64 @@ def calculate_ds_pop_from_conditional_raster(
     condition_id,
     expression,
     buffer_size_m,
-    wgs84_pixel_size,
+    max_downstream_distance_m,
     travel_time_pixel_size_m,
     working_dir,
     target_pop_raster_path,
 ):
+    """Calculate downstream population satisfying a conditional raster expression.
+
+    This function evaluates a user-provided expression on a base raster to
+    create a binary condition mask, routes that mask downstream using
+    multiple-flow-direction accumulation, optionally buffers and truncates it
+    by a maximum downstream distance, and then applies the resulting coverage
+    mask to a population raster. The masked population raster is written to
+    disk and its total population is returned.
+
+    Intermediate rasters (condition mask, clipped base, downstream coverage,
+    buffer kernel, distance transform, and optionally distance-limited
+    coverage) are created in ``working_dir`` with filenames derived from
+    ``condition_id`` and ``base_raster_path``.
+
+    Args:
+        aoi_vector_path: Path-like to a vector dataset defining the analysis
+            area of interest. Used to mask the warped base raster.
+        flow_dir_raster_path: Path-like to a flow-direction raster used as
+            input to ``routing.flow_accumulation_mfd``.
+        clipped_pop_raster_path: Path-like to a population raster already
+            aligned and clipped to the flow-direction grid.
+        base_raster_path: Path-like to the base raster on which
+            ``expression`` is evaluated to derive the condition mask.
+        condition_id: Identifier (string or value convertible to string) used
+            to differentiate intermediate filenames for this condition.
+        expression: String containing a Python expression evaluated with
+            ``value`` (a NumPy array of base raster values) and ``np``
+            (NumPy). Nonzero results define the condition mask.
+        buffer_size_m: Circular buffer radius in meters used to convolve the
+            downstream coverage raster.
+        max_downstream_distance_m: Optional maximum downstream distance in
+            meters. If not ``None``, a distance transform is used to zero out
+            coverage beyond this distance.
+        travel_time_pixel_size_m: Pixel size in meters used to convert the
+            distance-transform pixel counts to meters when applying
+            ``max_downstream_distance_m``.
+        working_dir: Path-like directory where all intermediate rasters and
+            kernels will be written.
+        target_pop_raster_path: Path-like where the final masked population
+            raster will be written.
+
+    Returns:
+        float: Sum of the population values in ``target_pop_raster_path``
+        after applying the downstream coverage and optional distance limit.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"max downstream distance: {max_downstream_distance_m}")
     condition_raster_path = (
-        working_dir / f"mask_{condition_id}_{base_raster_path.stem}.tif"
+        working_dir / f"mask_{condition_id}_{base_raster_path.name}"
     )
 
     clipped_base_raster_path = (
-        working_dir / f"clipped_{condition_id}_{base_raster_path.stem}.tif"
+        working_dir / f"clipped_{condition_id}_{base_raster_path.name}"
     )
 
     flow_dir_info = geoprocessing.get_raster_info(flow_dir_raster_path)
@@ -1002,9 +1104,7 @@ def calculate_ds_pop_from_conditional_raster(
         },
     )
 
-    base_raster_nodata = geoprocessing.get_raster_info(base_raster_path)[
-        "nodata"
-    ][0]
+    base_raster_nodata = base_info["nodata"][0]
 
     def _local_op(value):
         """Applies an elementwise expression to an array with nodata masking.
@@ -1040,7 +1140,7 @@ def calculate_ds_pop_from_conditional_raster(
     )
 
     ds_coverage_raster_path = str(
-        working_dir / f"ds_coverage_{condition_id}_{base_raster_path.stem}.tif"
+        working_dir / f"ds_coverage_{condition_id}_{base_raster_path.name}"
     )
 
     routing.flow_accumulation_mfd(
@@ -1064,9 +1164,46 @@ def calculate_ds_pop_from_conditional_raster(
         buffered_ds_coverage_raster_path,
         n_workers=1,
     )
+    if max_downstream_distance_m is not None:
+
+        def _distance_mask_op(mask, n_pixels):
+            return (
+                n_pixels * travel_time_pixel_size_m <= max_downstream_distance_m
+            )
+
+        distance_transform_raster_path = str(
+            working_dir / f"dt_{condition_id}_{base_raster_path.name}"
+        )
+        create_distance_transform(
+            condition_raster_path, distance_transform_raster_path
+        )
+        maxdist_buffered_ds_coverage_raster_path = str(
+            working_dir
+            / Path(
+                f"max_dist_{max_downstream_distance_m}_"
+                + (Path(buffered_ds_coverage_raster_path)).name
+            )
+        )
+        geoprocessing.raster_calculator(
+            [
+                (buffered_ds_coverage_raster_path, 1),
+                (distance_transform_raster_path, 1),
+            ],
+            _distance_mask_op,
+            maxdist_buffered_ds_coverage_raster_path,
+            gdal.GDT_Byte,
+            None,
+        )
+        buffered_ds_coverage_raster_path = (
+            maxdist_buffered_ds_coverage_raster_path
+        )
 
     def mask_op(mask, pop_val):
-        return np.where((mask > 0) & (pop_val > 0), pop_val, 0)
+        # mask values come from convolve so they can be veeeeeery close
+        # to 0 without being 0 when the should be, so we just cap that here
+        return np.where(
+            (mask > 100 * np.finfo(float).eps) & (pop_val > 0), pop_val, 0
+        )
 
     pop_info = geoprocessing.get_raster_info(clipped_pop_raster_path)
     geoprocessing.raster_calculator(
@@ -1083,9 +1220,7 @@ def calculate_ds_pop_from_conditional_raster(
 
 
 def calc_flow_dir(dem_path, working_dir, target_flow_dir_raster_path):
-    pit_filled_raster_path = (
-        working_dir / f"pit_filled_{Path(dem_path).stem}.tif"
-    )
+    pit_filled_raster_path = working_dir / f"pit_filled_{Path(dem_path).name}"
     routing.fill_pits(
         (dem_path, 1), pit_filled_raster_path, working_dir=working_dir
     )
@@ -1280,7 +1415,9 @@ def main() -> None:
                         section_id,
                         mask_section["params"]["expression"],
                         config["inputs"]["buffer_size_m"],
-                        config["inputs"]["wgs84_pixel_size"],
+                        mask_section["params"].get(
+                            "max_downstream_distance_m", None
+                        ),
                         config["inputs"]["travel_time_pixel_size_m"],
                         working_dir,
                         target_pop_raster_path,
