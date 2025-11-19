@@ -969,14 +969,14 @@ def create_distance_transform(
     base_mask_raster_path, target_distance_transform_path
 ):
 
-    src_ds = gdal.Open(base_mask_raster_path)
-    src_band = src_ds.GetRasterBand(1)
+    base_raster = gdal.Open(base_mask_raster_path)
+    src_band = base_raster.GetRasterBand(1)
 
     driver = gdal.GetDriverByName("GTiff")
-    dst_ds = driver.Create(
+    target_raster = driver.Create(
         target_distance_transform_path,
-        src_ds.RasterXSize,
-        src_ds.RasterYSize,
+        base_raster.RasterXSize,
+        base_raster.RasterYSize,
         1,
         gdal.GDT_Float32,
         [
@@ -989,15 +989,17 @@ def create_distance_transform(
         ],
     )
 
-    dst_ds.SetGeoTransform(src_ds.GetGeoTransform())
-    dst_ds.SetProjection(src_ds.GetProjection())
+    target_raster.SetGeoTransform(base_raster.GetGeoTransform())
+    target_raster.SetProjection(base_raster.GetProjection())
 
     gdal.ComputeProximity(
-        src_band, dst_ds.GetRasterBand(1), ["VALUES=1", "DISTUNITS=PIXEL"]
+        src_band,
+        target_raster.GetRasterBand(1),
+        ["VALUES=1", "DISTUNITS=PIXEL"],
     )
 
-    dst_ds = None
-    src_ds = None
+    target_raster = None
+    base_raster = None
 
 
 def calculate_ds_pop_from_conditional_raster(
