@@ -225,6 +225,7 @@ def main():
         )
 
         selected_pp_area_ha = 0.0
+        total_pop_selected = 0
         MAX_PP_AREA_HA = 100_000_000
         visted_subwatersheds = set()
 
@@ -234,10 +235,10 @@ def main():
         while selected_pp_area_ha < MAX_PP_AREA_HA:
             # find a subwatershed we haven't visted yet, but in decreasing
             # sorted order of pop
-            while sorted_seed_subwatershed_ids[
-                seed_ptr
-            ] in visted_subwatersheds and seed_ptr < len(
-                sorted_seed_subwatershed_ids
+            while (
+                seed_ptr < len(sorted_seed_subwatershed_ids)
+                and sorted_seed_subwatershed_ids[seed_ptr]
+                in visted_subwatersheds
             ):
                 seed_ptr += 1
             if seed_ptr >= len(sorted_seed_subwatershed_ids):
@@ -253,6 +254,9 @@ def main():
                 current_subwatershed_id = bfs_queue.popleft()
                 if current_subwatershed_id in visted_subwatersheds:
                     continue
+                total_pop_selected += subwatersheds_by_id_gdf.loc[
+                    current_subwatershed_id
+                ]["pop_sum"]
                 visted_subwatersheds.add(current_subwatershed_id)
 
                 # if it intersects the priority place, mark it and we're
@@ -260,7 +264,6 @@ def main():
                 if intersects_pp_by_subwatershed_id.get(
                     current_subwatershed_id, False
                 ):
-                    logging.info(current_subwatershed_id)
                     current_subwatershed_row = subwatersheds_by_id_gdf.loc[
                         current_subwatershed_id
                     ].copy()
@@ -277,9 +280,6 @@ def main():
                                 to_local_laea, clipped_pp_geom
                             ).area
                             / 10000.0
-                        )
-                        logging.debug(
-                            f"what is current_subwatershed_row: {current_subwatershed_row}"
                         )
                         current_subwatershed_row.geometry = clipped_pp_geom
                         current_subwatershed_row["pp_area_ha"] = float(
@@ -304,10 +304,21 @@ def main():
             selected_pp_subwatershed_rows,
             crs=subwatersheds_intersecting_pp.crs,
         )
+        final_union_geom = selected_pp_subwatersheds_gdf.geometry.union_all()
+        final_result_gdf = gpd.GeoDataFrame(
+            [
+                {
+                    "total_downstream_pop": float(total_pop_selected),
+                    "total_pp_selected_area_ha": float(selected_pp_area_ha),
+                    "geometry": final_union_geom,
+                }
+            ],
+            crs=selected_pp_subwatersheds_gdf.crs,
+        )
 
-        out_path = out_dir / f"{pp_vector_path.stem}_subwatersheds.shp"
+        out_path = out_dir / f"{pp_vector_path.stem}_subwatersheds.gpkg"
         logging.info(f"saving result to {str(out_path)}")
-        selected_pp_subwatersheds_gdf.to_file(out_path)
+        final_result_gdf.to_file(out_path)
 
 
 if __name__ == "__main__":
