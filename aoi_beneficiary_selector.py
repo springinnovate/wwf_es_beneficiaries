@@ -320,6 +320,8 @@ def main():
         logging.info(f"saving result to {str(out_path)}")
         final_result_gdf.to_file(out_path)
 
+        # TODO: i'm stuck on what to do for the arctic that doens't direclty intersect
+
 
 if __name__ == "__main__":
     main()
