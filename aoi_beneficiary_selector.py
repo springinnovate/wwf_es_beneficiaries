@@ -9,17 +9,22 @@ prioritize upstream areas based on the number of people affected downstream.
 from pathlib import Path
 import logging
 
-from osgeo import gdal
-import geopandas as gpd
 from pyproj import CRS
-
+from rasterio.features import geometry_mask
+from rasterio.windows import Window, from_bounds, intersection
+import geopandas as gpd
+import rasterio
 
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d - %(message)s",
 )
 
+logging.getLogger("rasterio").setLevel(logging.WARNING)
 logging.getLogger("pyogrio").setLevel(logging.WARNING)
+
+
+POPULATION_RASTER_PATH = "data/pop_rasters/landscan-global-2023.tif"
 
 MAX_PP_BUFFER_DISTANCE_M = 500 * 1000
 
@@ -97,10 +102,60 @@ def main():
 
         subwatersheds_bbox_intersecting_gdf = subwatershed_vector.iloc[
             subwatershed_candidate_row_idxs
-        ]
+        ].copy()
 
         if subwatersheds_bbox_intersecting_gdf.empty:
             continue
+
+        with rasterio.open(POPULATION_RASTER_PATH) as population_raster_ds:
+            subwatersheds_raster_crs_gdf = (
+                subwatersheds_bbox_intersecting_gdf.to_crs(
+                    population_raster_ds.crs
+                )
+            )
+            raster_full_window = Window(
+                0, 0, population_raster_ds.width, population_raster_ds.height
+            )
+
+            subwatershed_population_sum_vals = []
+            for subwatershed_geom in subwatersheds_raster_crs_gdf.geometry:
+                subwatershed_window = (
+                    from_bounds(
+                        *subwatershed_geom.bounds,
+                        transform=population_raster_ds.transform,
+                    )
+                    .round_offsets()
+                    .round_lengths()
+                )
+
+                subwatershed_window = intersection(
+                    subwatershed_window, raster_full_window
+                )
+
+                population_window_ma = population_raster_ds.read(
+                    1, window=subwatershed_window, masked=True
+                )
+                subwatershed_window_transform = (
+                    population_raster_ds.window_transform(subwatershed_window)
+                )
+
+                subwatershed_inside_mask = geometry_mask(
+                    [subwatershed_geom],
+                    out_shape=population_window_ma.shape,
+                    transform=subwatershed_window_transform,
+                    invert=True,
+                    all_touched=True,
+                )
+
+                subwatershed_population_sum = population_window_ma.filled(0)[
+                    subwatershed_inside_mask
+                ].sum()
+                subwatershed_population_sum_vals.append(
+                    float(subwatershed_population_sum)
+                )
+        subwatersheds_bbox_intersecting_gdf["pop_sum"] = (
+            subwatershed_population_sum_vals
+        )
 
         out_path = out_dir / f"{pp_vector_path.stem}_subwatersheds.shp"
         logging.info(f"saving result to {str(out_path)}")
