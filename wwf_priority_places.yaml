@@ -1,0 +1,43 @@
+aggregate_vector_path: data/subwatersheds/subwatersheds.gpkg
+out_dir: outputs/priorityPlaces
+
+focal_vectors:
+  - id: swio
+    path: data/priorityPlaces/swio
+    is_marine: true
+
+  - id: amazon
+    path: data/priorityPlaces/amazon
+    is_marine: false
+
+  - id: arctic
+    path: data/priorityPlaces/arctic
+    is_marine: true
+
+  - id: congoBasin
+    path: data/priorityPlaces/congoBasin
+    is_marine: false
+
+  - id: easternHimalayas
+    path: data/priorityPlaces/easternHimalayas
+    is_marine: false
+
+  - id: easternPacific
+    path: data/priorityPlaces/easternPacific
+    is_marine: true
+
+  - id: greaterMekong
+    path: data/priorityPlaces/greaterMekong
+    is_marine: false
+
+  - id: greatPlains
+    path: data/priorityPlaces/greatPlains
+    is_marine: false
+
+  - id: southernAfrica
+    path: data/priorityPlaces/southernAfrica
+    is_marine: false
+
+  - id: southwestPacific
+    path: data/priorityPlaces/southwestPacific
+    is_marine: true
