@@ -282,7 +282,7 @@ def main():
 
         seed_ptr = 0
         max_proposed_priorty_area_ha = focal_vector_entry[
-            "max_proposed_priorty_area_ha"
+            "max_proposed_priority_area_ha"
         ]
         while selected_pp_area_ha < max_proposed_priorty_area_ha:
             # find a subwatershed we haven't visted yet, but in decreasing
