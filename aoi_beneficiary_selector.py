@@ -8,7 +8,9 @@ prioritize upstream areas based on the number of people affected downstream.
 
 from collections import defaultdict, deque
 from pathlib import Path
+import argparse
 import logging
+import yaml
 
 from pyproj import CRS, Transformer
 from rasterio.features import geometry_mask
@@ -28,46 +30,68 @@ logging.getLogger("pyogrio").setLevel(logging.WARNING)
 
 POPULATION_RASTER_PATH = "data/pop_rasters/landscan-global-2023.tif"
 
-MAX_PP_BUFFER_DISTANCE_M = 500 * 1000
-
 
 def main():
-    subwatershed_vector_path = Path("data/dem_precondition/merged_lev06.shp")
-    pp_vector_dir = Path("data/priorityPlaces/")
-    out_dir = Path("output_aoi_beneficiary_selector/")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    """Entry point."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True, type=Path)
+    args = parser.parse_args()
 
-    subwatershed_vector = gpd.read_file(subwatershed_vector_path)
-    if subwatershed_vector.crs is None:
+    cfg = yaml.safe_load(args.config.read_text())
+    base = args.config.parent
+
+    aggregate_vector_path = Path(cfg["aggregate_vector_path"])
+    if not aggregate_vector_path.is_absolute():
+        aggregate_vector_path = (base / aggregate_vector_path).resolve()
+    aggregate_vector = gpd.read_file(aggregate_vector_path)
+    if aggregate_vector.crs is None:
         raise ValueError("Subwatershed layer has no CRS.")
 
-    for pp_vector_path in pp_vector_dir.iterdir():
-        logging.info(f"processing {pp_vector_path}")
+    out_dir = Path(cfg["out_dir"])
+    if not out_dir.is_absolute():
+        out_dir = (base / out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for focal_vector_entry in cfg["focal_vectors"]:
+        focal_id = focal_vector_entry["id"]
+
+        focal_vector_path = Path(focal_vector_entry["path"])
+        if not focal_vector_path.is_absolute():
+            focal_vector_path = (base / focal_vector_path).resolve()
+
+        is_marine = bool(focal_vector_entry["is_marine"])
+        max_pp_buffer_distance_m = float(
+            focal_vector_entry["buffer_distance_m"]
+        )
+
         try:
-            pp = gpd.read_file(pp_vector_path)
+            focal_vector = gpd.read_file(focal_vector_path)
         except:
             continue
-        if pp.empty:
+        if focal_vector.empty:
             logging.warning(
-                f"{pp_vector_path} does not intersect {subwatershed_vector_path}"
+                f"{focal_vector_path} does not intersect {aggregate_vector_path}"
             )
 
-        if pp.crs != subwatershed_vector.crs:
-            pp = pp.to_crs(subwatershed_vector.crs)
+        if focal_vector.crs != aggregate_vector.crs:
+            focal_vector = focal_vector.to_crs(aggregate_vector.crs)
 
-        priority_place_union_geom = pp.geometry.union_all()
-        pp_crs_obj = CRS.from_user_input(pp.crs)
+        priority_place_union_geom = focal_vector.geometry.union_all()
+        focal_vector_crs_obj = CRS.from_user_input(focal_vector.crs)
 
-        if pp_crs_obj.is_projected and pp_crs_obj.axis_info[0].unit_name in (
+        # buffer out the focal vector the MAX_PP_BUFFER_DISTANCE so it picks
+        # up the possible polygons to start with
+        if focal_vector_crs_obj.is_projected and focal_vector_crs_obj.axis_info[
+            0
+        ].unit_name in (
             "metre",
             "meter",
         ):
             priority_place_buffer_geom = priority_place_union_geom.buffer(
-                MAX_PP_BUFFER_DISTANCE_M
+                max_pp_buffer_distance_m
             )
         else:
             priority_place_union_wgs84_geom = (
-                gpd.GeoSeries([priority_place_union_geom], crs=pp.crs)
+                gpd.GeoSeries([priority_place_union_geom], crs=focal_vector.crs)
                 .to_crs("EPSG:4326")
                 .iloc[0]
             )
@@ -77,42 +101,65 @@ def main():
 
             local_aeqd_crs = CRS.from_proj4(
                 f"+proj=aeqd +lat_0={priority_place_centroid_wgs84_geom.y} "
-                f"+lon_0={priority_place_centroid_wgs84_geom.x} "
-                f"+datum=WGS84 +units=m +no_defs"
+                f"+lon_0={priority_place_centroid_wgs84_geom.x} +datum=WGS84 +units=m +no_defs +over"
             )
 
             priority_place_union_aeqd_geom = (
-                gpd.GeoSeries([priority_place_union_geom], crs=pp.crs)
+                gpd.GeoSeries([priority_place_union_geom], crs=focal_vector.crs)
                 .to_crs(local_aeqd_crs)
                 .iloc[0]
             )
-            priority_place_buffer_aeqd_geom = (
-                priority_place_union_aeqd_geom.buffer(MAX_PP_BUFFER_DISTANCE_M)
-            )
             priority_place_buffer_geom = (
                 gpd.GeoSeries(
-                    [priority_place_buffer_aeqd_geom], crs=local_aeqd_crs
+                    [priority_place_union_aeqd_geom], crs=local_aeqd_crs
                 )
-                .to_crs(pp.crs)
-                .iloc[0]
+                .buffer(max_pp_buffer_distance_m)
+                .to_crs(focal_vector.crs)
+                .buffer(0)
+            ).iloc[0]
+
+        if is_marine:
+            priority_place_union_geom = priority_place_buffer_geom
+
+            subwatershed_candidate_row_idxs = aggregate_vector.sindex.query(
+                priority_place_union_geom,
+                predicate="intersects",
             )
 
-        subwatershed_candidate_row_idxs = subwatershed_vector.sindex.query(
-            priority_place_buffer_geom,
-            predicate="intersects",
-        )
+            subwatershed_candidates = aggregate_vector.iloc[
+                subwatershed_candidate_row_idxs
+            ]
 
-        subwatersheds_intersecting_pp = subwatershed_vector.iloc[
+            diced_parts = subwatershed_candidates.geometry.intersection(
+                priority_place_union_geom
+            )
+            diced_parts = diced_parts[~diced_parts.is_empty]
+            # diced_gdf = subwatershed_candidates.loc[diced_parts.index].copy()
+            # diced_gdf.geometry = diced_parts
+            # diced_gdf.to_file(
+            #     "diced_parts.gpkg", layer="diced_parts", driver="GPKG"
+            # )
+
+            priority_place_union_geom = diced_parts.unary_union
+        else:
+            subwatershed_candidate_row_idxs = aggregate_vector.sindex.query(
+                priority_place_buffer_geom,
+                predicate="intersects",
+            )
+
+        subwatersheds_intersecting_focal_vector = aggregate_vector.iloc[
             subwatershed_candidate_row_idxs
         ].copy()
 
-        if subwatersheds_intersecting_pp.empty:
+        if subwatersheds_intersecting_focal_vector.empty:
             continue
 
         logging.info("gather population counts into intersecting subwatersheds")
         with rasterio.open(POPULATION_RASTER_PATH) as population_raster_ds:
-            subwatersheds_raster_crs_gdf = subwatersheds_intersecting_pp.to_crs(
-                population_raster_ds.crs
+            subwatersheds_raster_crs_gdf = (
+                subwatersheds_intersecting_focal_vector.to_crs(
+                    population_raster_ds.crs
+                )
             )
             raster_full_window = Window(
                 0, 0, population_raster_ds.width, population_raster_ds.height
@@ -155,16 +202,16 @@ def main():
                     float(subwatershed_population_sum)
                 )
 
-        subwatersheds_intersecting_pp["pop_sum"] = (
+        subwatersheds_intersecting_focal_vector["pop_sum"] = (
             subwatershed_population_sum_vals
         )
 
-        subwatersheds_intersecting_pp.loc[:, "pop_sum"] = (
+        subwatersheds_intersecting_focal_vector.loc[:, "pop_sum"] = (
             subwatershed_population_sum_vals
         )
         # we were getting duplicate rows, this ensures we have the same HYBAS_ID
         subwatersheds_intersecting_pp = (
-            subwatersheds_intersecting_pp.drop_duplicates(
+            subwatersheds_intersecting_focal_vector.drop_duplicates(
                 subset=["HYBAS_ID"]
             ).copy()
         )
@@ -173,8 +220,10 @@ def main():
         subwatershed_id_col = "HYBAS_ID"
         downstream_id_col = "NEXT_DOWN"
 
-        subwatersheds_by_id_gdf = subwatersheds_intersecting_pp.set_index(
-            subwatershed_id_col, drop=False
+        subwatersheds_by_id_gdf = (
+            subwatersheds_intersecting_focal_vector.drop_duplicates(
+                subwatershed_id_col, keep="first"
+            ).set_index(subwatershed_id_col, drop=False)
         )
         subwatershed_id_set = set(subwatersheds_by_id_gdf.index.to_numpy())
         next_upstream_ids_by_subwatershed_id = defaultdict(list)
@@ -199,7 +248,7 @@ def main():
         priority_place_union_wgs84_geom = (
             gpd.GeoSeries(
                 [priority_place_union_geom],
-                crs=subwatersheds_intersecting_pp.crs,
+                crs=subwatersheds_intersecting_focal_vector.crs,
             )
             .to_crs("EPSG:4326")
             .iloc[0]
@@ -213,13 +262,13 @@ def main():
             f"+datum=WGS84 +units=m +no_defs"
         )
         to_local_laea = Transformer.from_crs(
-            subwatersheds_intersecting_pp.crs,
+            subwatersheds_intersecting_focal_vector.crs,
             local_laea_crs,
             always_xy=True,
         ).transform
 
         sorted_seed_subwatershed_ids = (
-            subwatersheds_intersecting_pp.sort_values(
+            subwatersheds_intersecting_focal_vector.sort_values(
                 "pop_sum", ascending=False
             )[subwatershed_id_col].to_list()
         )
@@ -232,7 +281,10 @@ def main():
         selected_pp_subwatershed_rows = []
 
         seed_ptr = 0
-        while selected_pp_area_ha < MAX_PP_AREA_HA:
+        max_proposed_priorty_area_ha = focal_vector_entry[
+            "max_proposed_priorty_area_ha"
+        ]
+        while selected_pp_area_ha < max_proposed_priorty_area_ha:
             # find a subwatershed we haven't visted yet, but in decreasing
             # sorted order of pop
             while (
@@ -302,25 +354,23 @@ def main():
 
         selected_pp_subwatersheds_gdf = gpd.GeoDataFrame(
             selected_pp_subwatershed_rows,
-            crs=subwatersheds_intersecting_pp.crs,
+            crs=subwatersheds_intersecting_focal_vector.crs,
         )
         final_union_geom = selected_pp_subwatersheds_gdf.geometry.union_all()
         final_result_gdf = gpd.GeoDataFrame(
             [
                 {
-                    "total_downstream_pop": float(total_pop_selected),
-                    "total_pp_selected_area_ha": float(selected_pp_area_ha),
+                    "total_downstream_pop": int(total_pop_selected),
+                    "total_pp_selected_area_ha": int(selected_pp_area_ha),
                     "geometry": final_union_geom,
                 }
             ],
             crs=selected_pp_subwatersheds_gdf.crs,
         )
 
-        out_path = out_dir / f"{pp_vector_path.stem}_subwatersheds.gpkg"
+        out_path = out_dir / f"{focal_id}_proposed_areas.gpkg"
         logging.info(f"saving result to {str(out_path)}")
         final_result_gdf.to_file(out_path)
-
-        # TODO: i'm stuck on what to do for the arctic that doens't direclty intersect
 
 
 if __name__ == "__main__":
