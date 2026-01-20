@@ -134,12 +134,6 @@ def main():
                 priority_place_union_geom
             )
             diced_parts = diced_parts[~diced_parts.is_empty]
-            # diced_gdf = subwatershed_candidates.loc[diced_parts.index].copy()
-            # diced_gdf.geometry = diced_parts
-            # diced_gdf.to_file(
-            #     "diced_parts.gpkg", layer="diced_parts", driver="GPKG"
-            # )
-
             priority_place_union_geom = diced_parts.unary_union
         else:
             subwatershed_candidate_row_idxs = aggregate_vector.sindex.query(
