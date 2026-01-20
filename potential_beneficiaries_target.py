@@ -49,6 +49,48 @@ def erode_to_area_ha(
     area_tolerance_hectares,
     maximum_iterations,
 ):
+    """Erodes the selected subwatershed geometry to approach a target maximum area.
+
+    The input GeoDataFrame is reprojected to `target_linear_crs` to ensure that the
+    erosion distance is applied in linear units (e.g., meters/feet). The geometry is
+    then iteratively "eroded" (buffered inward) and evaluated by area in hectares.
+    A bracketing step expands the erosion distance upper bound until the eroded
+    geometry becomes empty or its area is less than or equal to the target maximum.
+    A binary search is then used to find an erosion distance that yields an area
+    within `area_tolerance_hectares` of `max_proposed_priority_area_hectares`.
+
+    If no geometry is found within tolerance after `maximum_iterations`, the
+    function falls back to returning the original union geometry (i.e., no erosion).
+
+    The returned GeoDataFrame contains a single feature (the first row of the input),
+    with its geometry replaced by the selected eroded geometry (or the fallback
+    original geometry).
+
+    Args:
+        selected_pp_subwatersheds_geodataframe: GeoDataFrame containing the selected
+            subwatershed polygon(s). This function uses the geometry from the first
+            row as the starting geometry and also uses the GeoDataFrame in erosion
+            operations.
+        max_proposed_priority_area_hectares: Target maximum area (in hectares) for
+            the returned geometry. If the starting geometry area is already less
+            than or equal to this value, the reprojected GeoDataFrame is returned
+            unchanged.
+        target_linear_crs: CRS to reproject into before applying erosion distances.
+            This should be a projected CRS with linear units (not a geographic CRS).
+        area_tolerance_hectares: Acceptable absolute difference (in hectares) between
+            the eroded geometry area and `max_proposed_priority_area_hectares` for
+            early termination of the binary search.
+        maximum_iterations: Maximum number of binary-search iterations to perform
+            when refining the erosion distance.
+
+    Returns:
+        A single-row GeoDataFrame in `target_linear_crs` whose geometry is the best
+        candidate eroded geometry found. If erosion produces an empty geometry for
+        all tested distances, returns an empty-geometry GeoDataFrame with the same
+        non-geometry columns and CRS. If no candidate meets tolerance within the
+        iteration limit, returns the original union geometry.
+
+    """
     subwatersheds_in_target_crs_geodataframe = (
         selected_pp_subwatersheds_geodataframe.to_crs(target_linear_crs).copy()
     )
