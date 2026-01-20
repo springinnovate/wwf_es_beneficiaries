@@ -1,0 +1,63 @@
+aggregate_vector_path: data/dem_precondition/merged_lev06.shp
+out_dir: outputs/
+
+focal_vectors:
+  - id: arctic
+    path: data/priorityPlaces/arctic
+    is_marine: false
+    buffer_distance_m: 500000
+    max_proposed_priority_area_ha: 100000000
+
+  - id: swio
+    path: data/priorityPlaces/swio
+    is_marine: true
+    buffer_distance_m: 5000
+    max_proposed_priority_area_ha: 100000000
+
+  - id: amazon
+    path: data/priorityPlaces/amazon
+    is_marine: false
+    max_proposed_priority_area_ha: 100000000
+    buffer_distance_m: 500000
+
+  - id: congoBasin
+    path: data/priorityPlaces/congoBasin
+    is_marine: false
+    max_proposed_priority_area_ha: 100000000
+    buffer_distance_m: 500000
+
+  - id: easternHimalayas
+    path: data/priorityPlaces/easternHimalayas
+    is_marine: false
+    max_proposed_priority_area_ha: 100000000
+    buffer_distance_m: 500000
+
+  - id: easternPacific
+    path: data/priorityPlaces/easternPacific
+    is_marine: true
+    max_proposed_priority_area_ha: 100000000
+    buffer_distance_m: 5000
+
+  - id: greaterMekong
+    path: data/priorityPlaces/greaterMekong
+    is_marine: false
+    max_proposed_priority_area_ha: 100000000
+    buffer_distance_m: 500000
+
+  - id: greatPlains
+    path: data/priorityPlaces/greatPlains
+    is_marine: false
+    max_proposed_priority_area_ha: 100000000
+    buffer_distance_m: 500000
+
+  - id: southernAfrica
+    path: data/priorityPlaces/southernAfrica
+    is_marine: false
+    max_proposed_priority_area_ha: 100000000
+    buffer_distance_m: 500000
+
+  - id: southwestPacific
+    path: data/priorityPlaces/southwestPacific
+    is_marine: true
+    max_proposed_priority_area_ha: 100000000
+    buffer_distance_m: 5000
