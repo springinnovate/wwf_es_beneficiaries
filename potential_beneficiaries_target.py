@@ -33,10 +33,31 @@ POPULATION_RASTER_PATH = "data/pop_rasters/landscan-global-2023.tif"
 
 
 def _area_ha(geom):
+    """Returns the area of a geometry in hectares.
+
+    Args:
+        geom: Shapely geometry with an `.area` attribute in square units of the
+            geometry's CRS.
+
+    Returns:
+        Area in hectares (square meters / 10,000) assuming the CRS units are meters.
+    """
     return geom.area / 10000.0
 
 
 def _erode_union(gdf, dist_m):
+    """Unions all geometries in a GeoDataFrame and erodes the result by a distance.
+
+    The erosion is performed by applying a negative buffer to the unioned geometry.
+
+    Args:
+        gdf: GeoDataFrame whose geometries will be unioned.
+        dist_m: Erosion distance in the CRS linear units (typically meters). A
+            positive value erodes by buffering with `-dist_m`.
+
+    Returns:
+        A shapely geometry representing the unioned and eroded result.
+    """
     geom = gdf.geometry.union_all()
     geom = geom.buffer(-dist_m)
     return geom
