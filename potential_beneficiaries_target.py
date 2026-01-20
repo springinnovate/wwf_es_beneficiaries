@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 import argparse
 import logging
+import math
 import yaml
 
 from pyproj import CRS, Transformer
@@ -29,6 +30,97 @@ logging.getLogger("pyogrio").setLevel(logging.WARNING)
 
 
 POPULATION_RASTER_PATH = "data/pop_rasters/landscan-global-2023.tif"
+
+
+def _area_ha(geom):
+    return geom.area / 10000.0
+
+
+def _erode_union(gdf, dist_m):
+    geom = gdf.geometry.union_all()
+    geom = geom.buffer(-dist_m)
+    return geom
+
+
+def erode_to_area_ha(
+    selected_pp_subwatersheds_gdf,
+    max_proposed_priorty_area_ha,
+    linear_crs,
+    tol_ha=0.1,
+    max_iter=50,
+):
+    gdf = selected_pp_subwatersheds_gdf.to_crs(linear_crs).copy()
+    gdf.geometry = gdf.geometry.buffer(0)
+    logging.debug(gdf)
+    gdf.to_file("test.gpkg")
+    base_ha = _area_ha(gdf.geometry.iloc[0])
+    logging.debug(base_ha)
+
+    if base_ha <= max_proposed_priorty_area_ha:
+        logging.info(
+            f"{base_ha} is less than the max proproposed {max_proposed_priorty_area_ha}"
+        )
+        return gdf.copy()
+
+    low = 0
+    high = 1
+    geom_high = _erode_union(gdf, high)
+    logging.debug(f"first geom high {geom_high}")
+    while (not geom_high.is_empty) and (
+        _area_ha(geom_high) > max_proposed_priorty_area_ha
+    ):
+        logging.info(f"high: {high} vs low: {low}")
+        high *= 2.0
+        geom_high = _erode_union(gdf, high)
+
+    if geom_high.is_empty:
+        high = high / 2.0
+        geom_high = _erode_union(gdf, high)
+        if geom_high.is_empty:
+            return gpd.GeoDataFrame(
+                gdf.drop(columns="geometry"), geometry=[], crs=gdf.crs
+            )
+
+    original_geom = gdf.geometry.unary_union
+    best_geom = geom_high
+    best_err = abs(_area_ha(best_geom) - max_proposed_priorty_area_ha)
+    found_it = False
+    for _ in range(max_iter):
+        logging.info(f"high: {high} vs low: {low}")
+        mid = (low + high) / 2.0
+        geom_mid = _erode_union(gdf, mid)
+
+        if geom_mid.is_empty:
+            high = mid
+            continue
+
+        a = _area_ha(geom_mid)
+        logging.debug(
+            f"area: {a:.1f}ha vs {max_proposed_priorty_area_ha:.1f} difference of {a-max_proposed_priorty_area_ha:.1f}"
+        )
+        err = abs(a - max_proposed_priorty_area_ha)
+
+        if err < best_err:
+            best_err = err
+            best_geom = geom_mid
+
+        if err <= tol_ha:
+            best_geom = geom_mid
+            found_it = True
+            break
+
+        if a > max_proposed_priorty_area_ha:
+            low = mid
+        else:
+            high = mid
+
+    if not found_it:
+        best_geom = original_geom
+
+    out = gdf.iloc[:1].copy()
+    out.loc[out.index[0], out.geometry.name] = best_geom
+
+    return out
 
 
 def main():
@@ -269,7 +361,6 @@ def main():
 
         selected_pp_area_ha = 0.0
         total_pop_selected = 0
-        MAX_PP_AREA_HA = 100_000_000
         visted_subwatersheds = set()
 
         selected_pp_subwatershed_rows = []
@@ -350,6 +441,23 @@ def main():
             selected_pp_subwatershed_rows,
             crs=subwatersheds_intersecting_focal_vector.crs,
         )
+        # union all those features into one big blob
+        union_geom = selected_pp_subwatersheds_gdf.geometry.union_all()
+        selected_pp_subwatersheds_gdf = gpd.GeoDataFrame(
+            [
+                {
+                    "pp_area_ha": float(
+                        selected_pp_subwatersheds_gdf["pp_area_ha"].sum()
+                    ),
+                    "pop_sum": float(
+                        selected_pp_subwatersheds_gdf["pop_sum"].sum()
+                    ),
+                    "geometry": union_geom,
+                }
+            ],
+            crs=selected_pp_subwatersheds_gdf.crs,
+        )
+
         final_union_geom = selected_pp_subwatersheds_gdf.geometry.union_all()
         final_result_gdf = gpd.GeoDataFrame(
             [
@@ -361,6 +469,22 @@ def main():
             ],
             crs=selected_pp_subwatersheds_gdf.crs,
         )
+
+        final_result_gdf = erode_to_area_ha(
+            final_result_gdf,
+            max_proposed_priorty_area_ha,
+            local_aeqd_crs,
+            tol_ha=0.01 * max_proposed_priorty_area_ha,
+            max_iter=50,
+        )
+        final_result_gdf.loc[
+            final_result_gdf.index[0], "total_pp_selected_area_ha"
+        ] = int(
+            final_result_gdf.to_crs(local_aeqd_crs).geometry.iloc[0].area
+            / 10000.0
+        )
+        final_result_gdf.to_file("out.gpkg")
+        return
 
         out_path = out_dir / f"{focal_id}_proposed_areas.gpkg"
         logging.info(f"saving result to {str(out_path)}")
