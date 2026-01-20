@@ -51,10 +51,7 @@ def erode_to_area_ha(
 ):
     gdf = selected_pp_subwatersheds_gdf.to_crs(linear_crs).copy()
     gdf.geometry = gdf.geometry.buffer(0)
-    logging.debug(gdf)
-    gdf.to_file("test.gpkg")
     base_ha = _area_ha(gdf.geometry.iloc[0])
-    logging.debug(base_ha)
 
     if base_ha <= max_proposed_priorty_area_ha:
         logging.info(
@@ -65,7 +62,6 @@ def erode_to_area_ha(
     low = 0
     high = 1
     geom_high = _erode_union(gdf, high)
-    logging.debug(f"first geom high {geom_high}")
     while (not geom_high.is_empty) and (
         _area_ha(geom_high) > max_proposed_priorty_area_ha
     ):
@@ -95,9 +91,6 @@ def erode_to_area_ha(
             continue
 
         a = _area_ha(geom_mid)
-        logging.debug(
-            f"area: {a:.1f}ha vs {max_proposed_priorty_area_ha:.1f} difference of {a-max_proposed_priorty_area_ha:.1f}"
-        )
         err = abs(a - max_proposed_priorty_area_ha)
 
         if err < best_err:
@@ -483,8 +476,6 @@ def main():
             final_result_gdf.to_crs(local_aeqd_crs).geometry.iloc[0].area
             / 10000.0
         )
-        final_result_gdf.to_file("out.gpkg")
-        return
 
         out_path = out_dir / f"{focal_id}_proposed_areas.gpkg"
         logging.info(f"saving result to {str(out_path)}")
