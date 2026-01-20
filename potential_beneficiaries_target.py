@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 import argparse
 import logging
+import math
 import yaml
 
 from pyproj import CRS, Transformer
@@ -29,6 +30,196 @@ logging.getLogger("pyogrio").setLevel(logging.WARNING)
 
 
 POPULATION_RASTER_PATH = "data/pop_rasters/landscan-global-2023.tif"
+
+
+def _area_ha(geom):
+    """Returns the area of a geometry in hectares.
+
+    Args:
+        geom: Shapely geometry with an `.area` attribute in square units of the
+            geometry's CRS.
+
+    Returns:
+        Area in hectares (square meters / 10,000) assuming the CRS units are meters.
+    """
+    return geom.area / 10000.0
+
+
+def _erode_union(gdf, dist_m):
+    """Unions all geometries in a GeoDataFrame and erodes the result by a distance.
+
+    The erosion is performed by applying a negative buffer to the unioned geometry.
+
+    Args:
+        gdf: GeoDataFrame whose geometries will be unioned.
+        dist_m: Erosion distance in the CRS linear units (typically meters). A
+            positive value erodes by buffering with `-dist_m`.
+
+    Returns:
+        A shapely geometry representing the unioned and eroded result.
+    """
+    geom = gdf.geometry.union_all()
+    geom = geom.buffer(-dist_m)
+    return geom
+
+
+def erode_to_area_ha(
+    selected_pp_subwatersheds_geodataframe,
+    max_proposed_priority_area_hectares,
+    target_linear_crs,
+    area_tolerance_hectares,
+    maximum_iterations,
+):
+    """Erodes the selected subwatershed geometry to approach a target maximum area.
+
+    The input GeoDataFrame is reprojected to `target_linear_crs` to ensure that the
+    erosion distance is applied in linear units (e.g., meters/feet). The geometry is
+    then iteratively "eroded" (buffered inward) and evaluated by area in hectares.
+    A bracketing step expands the erosion distance upper bound until the eroded
+    geometry becomes empty or its area is less than or equal to the target maximum.
+    A binary search is then used to find an erosion distance that yields an area
+    within `area_tolerance_hectares` of `max_proposed_priority_area_hectares`.
+
+    If no geometry is found within tolerance after `maximum_iterations`, the
+    function falls back to returning the original union geometry (i.e., no erosion).
+
+    The returned GeoDataFrame contains a single feature (the first row of the input),
+    with its geometry replaced by the selected eroded geometry (or the fallback
+    original geometry).
+
+    Args:
+        selected_pp_subwatersheds_geodataframe: GeoDataFrame containing the selected
+            subwatershed polygon(s). This function uses the geometry from the first
+            row as the starting geometry and also uses the GeoDataFrame in erosion
+            operations.
+        max_proposed_priority_area_hectares: Target maximum area (in hectares) for
+            the returned geometry. If the starting geometry area is already less
+            than or equal to this value, the reprojected GeoDataFrame is returned
+            unchanged.
+        target_linear_crs: CRS to reproject into before applying erosion distances.
+            This should be a projected CRS with linear units (not a geographic CRS).
+        area_tolerance_hectares: Acceptable absolute difference (in hectares) between
+            the eroded geometry area and `max_proposed_priority_area_hectares` for
+            early termination of the binary search.
+        maximum_iterations: Maximum number of binary-search iterations to perform
+            when refining the erosion distance.
+
+    Returns:
+        A single-row GeoDataFrame in `target_linear_crs` whose geometry is the best
+        candidate eroded geometry found. If erosion produces an empty geometry for
+        all tested distances, returns an empty-geometry GeoDataFrame with the same
+        non-geometry columns and CRS. If no candidate meets tolerance within the
+        iteration limit, returns the original union geometry.
+
+    """
+    subwatersheds_in_target_crs_geodataframe = (
+        selected_pp_subwatersheds_geodataframe.to_crs(target_linear_crs).copy()
+    )
+    subwatersheds_in_target_crs_geodataframe.geometry = (
+        subwatersheds_in_target_crs_geodataframe.geometry.buffer(0)
+    )
+
+    starting_area_hectares = _area_ha(
+        subwatersheds_in_target_crs_geodataframe.geometry.iloc[0]
+    )
+
+    if starting_area_hectares <= max_proposed_priority_area_hectares:
+        logging.info(
+            f"{starting_area_hectares} is less than the max proposed {max_proposed_priority_area_hectares}"
+        )
+        return subwatersheds_in_target_crs_geodataframe.copy()
+
+    erosion_distance_lower_bound = 0.0
+    erosion_distance_upper_bound = 1.0
+
+    geometry_at_upper_bound = _erode_union(
+        subwatersheds_in_target_crs_geodataframe,
+        erosion_distance_upper_bound,
+    )
+    while (not geometry_at_upper_bound.is_empty) and (
+        _area_ha(geometry_at_upper_bound) > max_proposed_priority_area_hectares
+    ):
+        logging.info(
+            f"upper_bound: {erosion_distance_upper_bound} vs lower_bound: {erosion_distance_lower_bound}"
+        )
+        erosion_distance_upper_bound *= 2.0
+        geometry_at_upper_bound = _erode_union(
+            subwatersheds_in_target_crs_geodataframe,
+            erosion_distance_upper_bound,
+        )
+
+    if geometry_at_upper_bound.is_empty:
+        erosion_distance_upper_bound = erosion_distance_upper_bound / 2.0
+        geometry_at_upper_bound = _erode_union(
+            subwatersheds_in_target_crs_geodataframe,
+            erosion_distance_upper_bound,
+        )
+        if geometry_at_upper_bound.is_empty:
+            return gpd.GeoDataFrame(
+                subwatersheds_in_target_crs_geodataframe.drop(
+                    columns="geometry"
+                ),
+                geometry=[],
+                crs=subwatersheds_in_target_crs_geodataframe.crs,
+            )
+
+    original_union_geometry = (
+        subwatersheds_in_target_crs_geodataframe.geometry.unary_union
+    )
+    best_candidate_geometry = geometry_at_upper_bound
+    best_candidate_area_error_hectares = abs(
+        _area_ha(best_candidate_geometry) - max_proposed_priority_area_hectares
+    )
+    found_geometry_within_tolerance = False
+
+    for iteration_index in range(maximum_iterations):
+        logging.info(
+            f"upper_bound: {erosion_distance_upper_bound} vs lower_bound: {erosion_distance_lower_bound}"
+        )
+
+        erosion_distance_midpoint = (
+            erosion_distance_lower_bound + erosion_distance_upper_bound
+        ) / 2.0
+        geometry_at_midpoint = _erode_union(
+            subwatersheds_in_target_crs_geodataframe,
+            erosion_distance_midpoint,
+        )
+
+        if geometry_at_midpoint.is_empty:
+            erosion_distance_upper_bound = erosion_distance_midpoint
+            continue
+
+        midpoint_area_hectares = _area_ha(geometry_at_midpoint)
+        midpoint_area_error_hectares = abs(
+            midpoint_area_hectares - max_proposed_priority_area_hectares
+        )
+
+        if midpoint_area_error_hectares < best_candidate_area_error_hectares:
+            best_candidate_area_error_hectares = midpoint_area_error_hectares
+            best_candidate_geometry = geometry_at_midpoint
+
+        if midpoint_area_error_hectares <= area_tolerance_hectares:
+            best_candidate_geometry = geometry_at_midpoint
+            found_geometry_within_tolerance = True
+            break
+
+        if midpoint_area_hectares > max_proposed_priority_area_hectares:
+            erosion_distance_lower_bound = erosion_distance_midpoint
+        else:
+            erosion_distance_upper_bound = erosion_distance_midpoint
+
+    if not found_geometry_within_tolerance:
+        best_candidate_geometry = original_union_geometry
+
+    output_single_feature_geodataframe = (
+        subwatersheds_in_target_crs_geodataframe.iloc[:1].copy()
+    )
+    output_single_feature_geodataframe.loc[
+        output_single_feature_geodataframe.index[0],
+        output_single_feature_geodataframe.geometry.name,
+    ] = best_candidate_geometry
+
+    return output_single_feature_geodataframe
 
 
 def main():
@@ -269,7 +460,6 @@ def main():
 
         selected_pp_area_ha = 0.0
         total_pop_selected = 0
-        MAX_PP_AREA_HA = 100_000_000
         visted_subwatersheds = set()
 
         selected_pp_subwatershed_rows = []
@@ -350,6 +540,23 @@ def main():
             selected_pp_subwatershed_rows,
             crs=subwatersheds_intersecting_focal_vector.crs,
         )
+        # union all those features into one big blob
+        union_geom = selected_pp_subwatersheds_gdf.geometry.union_all()
+        selected_pp_subwatersheds_gdf = gpd.GeoDataFrame(
+            [
+                {
+                    "pp_area_ha": float(
+                        selected_pp_subwatersheds_gdf["pp_area_ha"].sum()
+                    ),
+                    "pop_sum": float(
+                        selected_pp_subwatersheds_gdf["pop_sum"].sum()
+                    ),
+                    "geometry": union_geom,
+                }
+            ],
+            crs=selected_pp_subwatersheds_gdf.crs,
+        )
+
         final_union_geom = selected_pp_subwatersheds_gdf.geometry.union_all()
         final_result_gdf = gpd.GeoDataFrame(
             [
@@ -360,6 +567,22 @@ def main():
                 }
             ],
             crs=selected_pp_subwatersheds_gdf.crs,
+        )
+
+        max_erode_iterations = 50
+        area_tolerance = 0.01 * max_proposed_priorty_area_ha
+        final_result_gdf = erode_to_area_ha(
+            final_result_gdf,
+            max_proposed_priorty_area_ha,
+            local_aeqd_crs,
+            area_tolerance,
+            max_erode_iterations,
+        )
+        final_result_gdf.loc[
+            final_result_gdf.index[0], "total_pp_selected_area_ha"
+        ] = int(
+            final_result_gdf.to_crs(local_aeqd_crs).geometry.iloc[0].area
+            / 10000.0
         )
 
         out_path = out_dir / f"{focal_id}_proposed_areas.gpkg"
