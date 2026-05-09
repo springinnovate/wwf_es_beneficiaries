@@ -1421,15 +1421,15 @@ def main() -> None:
         )
         combined_header = "combined pop"
         section_mask_ids.add(combined_header)
-        pop_results[aoi_key] = combined_task
+        pop_results[aoi_key][combined_header] = combined_task
 
     task_graph.join()
     rows = []
     for aoi_key, results in pop_results.items():
         row = {"aoi": aoi_key}
-        pop_count_results = results.get()
-        for header in pop_count_results:
-            row[header] = pop_count_results[header]
+        pop_count_results = results[combined_header].get()
+        for header in section_mask_ids:
+            row[header] = pop_count_results.get(header, "n/a")
         rows.append(row)
 
     df = pd.DataFrame(rows, columns=["aoi"] + list(section_mask_ids))
