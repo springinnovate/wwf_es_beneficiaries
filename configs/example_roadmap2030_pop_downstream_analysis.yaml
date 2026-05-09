@@ -11,6 +11,10 @@ inputs:
   traveltime_raster_path: "./data/travel_time/friction_surface_2019_compressed_md5_1be7dd230178a5d395529be7a5e3fb0a.tif"
   dem_raster_path: "./data/dem_precondition/astgtm_compressed.tif"
   subwatershed_vector_path: "./data/dem_precondition/merged_lev06.shp"
+  # Set this to true only when you intentionally want one generated AOI over
+  # the shared extent of the population, travel-time, DEM, and condition rasters.
+  # When true, leave aoi_vector_pattern empty.
+  analyze_full_raster_extent: false
   aoi_vector_pattern:
     - "./data/aois/aoi_by_country/*.gpkg"
     - "./data/aois/WWF-Int_Pilot-sites/*/*.shp"

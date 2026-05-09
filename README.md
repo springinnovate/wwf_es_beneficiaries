@@ -37,3 +37,8 @@ The analysis is orchestrated by a workflow runner that takes a YAML configuratio
        python workflow_runner.py example_roadmap2030_pop_downstream_analysis.yaml
 
 Use different YAML configuration files to run other analyses as needed.
+
+To run over the full overlapping raster extent instead of AOI vector files, set
+`inputs.analyze_full_raster_extent: true` and leave `aoi_vector_pattern` empty.
+The workflow will generate one AOI named `full_raster_extent` from the shared
+bounds of the population, travel-time, DEM, and condition rasters.

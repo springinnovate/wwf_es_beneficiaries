@@ -28,7 +28,12 @@ from ecoshard import taskgraph
 import psutil
 import yaml
 
-from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.warp import (
+    calculate_default_transform,
+    reproject,
+    Resampling,
+    transform_bounds,
+)
 from ecoshard import geoprocessing
 from ecoshard.geoprocessing import routing
 from osgeo import gdal, osr
@@ -46,6 +51,9 @@ from pyproj import CRS, Transformer, Geod
 import shortest_distances
 
 logging.getLogger("rasterio").setLevel(logging.WARNING)
+
+
+FULL_RASTER_EXTENT_AOI_ID = "full_raster_extent"
 
 
 @dataclass
@@ -231,6 +239,7 @@ def process_config(config_path: Path) -> Dict[str, Any]:
                 - 'traveltime_raster_path' (str)
                 - 'subwatershed_vector_path' (str)
                 - 'aoi_vector_pattern' (list[str])
+                - 'analyze_full_raster_extent' (bool)
             - 'masks' (list[dict]): Each item has 'id' (str), 'type' (str),
               and 'params' (dict).
             - 'combine' (list[dict]): As provided in the YAML 'combine'
@@ -243,7 +252,8 @@ def process_config(config_path: Path) -> Dict[str, Any]:
             - The 'inputs' section is missing or empty.
             - Any required input is missing:
                 'population_raster_path', 'traveltime_raster_path',
-                'subwatershed_vector_path', or 'aoi_vector_pattern'.
+                'subwatershed_vector_path', or 'aoi_vector_pattern' when
+                'analyze_full_raster_extent' is not enabled.
             - Any 'sections' entry is not a mapping (dict).
             - A 'masks' or 'combine' item within 'sections' is not a dict.
             - The 'sections' block does not include both a 'masks' and
@@ -277,7 +287,16 @@ def process_config(config_path: Path) -> Dict[str, Any]:
     traveltime_raster_path = inputs.get("traveltime_raster_path", "")
     subwatershed_vector_path = inputs.get("subwatershed_vector_path", "")
     dem_raster_path = inputs.get("dem_raster_path", "")
-    aoi_vector_pattern = _as_list(inputs.get("aoi_vector_pattern", []))
+    aoi_vector_pattern = [
+        pattern for pattern in _as_list(inputs.get("aoi_vector_pattern", []))
+        if pattern
+    ]
+    analyze_full_raster_extent = inputs.get("analyze_full_raster_extent", False)
+    if not isinstance(analyze_full_raster_extent, bool):
+        raise ValueError(
+            "`inputs.analyze_full_raster_extent` must be true or false, "
+            f"got {analyze_full_raster_extent!r}"
+        )
 
     wgs84_pixel_size = inputs.get("wgs84_pixel_size", None)
     travel_time_pixel_size_m = inputs.get("travel_time_pixel_size_m", None)
@@ -310,7 +329,12 @@ def process_config(config_path: Path) -> Dict[str, Any]:
             f"subwatershed_vector_path does not exist: {subwatershed_vector_path}"
         )
 
-    if not aoi_vector_pattern:
+    if analyze_full_raster_extent and aoi_vector_pattern:
+        missing_messages.append(
+            "aoi_vector_pattern must be empty when "
+            "analyze_full_raster_extent is true"
+        )
+    elif not analyze_full_raster_extent and not aoi_vector_pattern:
         missing_messages.append("aoi_vector_pattern is empty")
 
     if wgs84_pixel_size is None:
@@ -401,6 +425,7 @@ def process_config(config_path: Path) -> Dict[str, Any]:
             "subwatershed_vector_path": Path(subwatershed_vector_path),
             "dem_raster_path": Path(dem_raster_path),
             "aoi_vector_pattern": aoi_vector_pattern,
+            "analyze_full_raster_extent": analyze_full_raster_extent,
             "wgs84_pixel_size": float(wgs84_pixel_size),
             "travel_time_pixel_size_m": float(travel_time_pixel_size_m),
             "buffer_size_m": float(buffer_size_m),
@@ -557,6 +582,96 @@ def print_yaml_config(config):
     logger.info("  to_file: %s", config["logging"]["to_file"])
 
 
+def _raster_paths_for_full_extent(config: dict) -> list[Path]:
+    """Return rasters that constrain the generated full-extent AOI.
+
+    Args:
+        config: Normalized workflow configuration returned by
+            ``process_config``. The configuration must include input paths for
+            the population, travel-time, and DEM rasters, plus any conditional
+            raster mask sections that should limit the generated AOI extent.
+
+    Returns:
+        Ordered list of unique raster paths whose WGS84 bounds should be
+        intersected to create the generated full-raster AOI.
+    """
+    inputs = config["inputs"]
+    raster_paths = [
+        inputs["population_raster_path"],
+        inputs["traveltime_raster_path"],
+        inputs["dem_raster_path"],
+    ]
+    for mask_section in config["masks"]:
+        if mask_section["type"] != "conditional_raster":
+            continue
+        condition_raster_path = mask_section.get("params", {}).get(
+            "condition_raster_path"
+        )
+        if condition_raster_path:
+            raster_paths.append(Path(condition_raster_path))
+
+    unique_paths = []
+    seen_paths = set()
+    for raster_path in raster_paths:
+        path = Path(raster_path)
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        unique_paths.append(path)
+    return unique_paths
+
+
+def create_full_raster_extent_aoi(config: dict, target_aoi_vector_path: Path) -> None:
+    """Create an AOI over the shared WGS84 bounds of all analysis rasters.
+
+    Args:
+        config: Normalized workflow configuration returned by
+            ``process_config``. The population, travel-time, DEM, and
+            conditional raster paths are used to determine the overlapping
+            raster extent.
+        target_aoi_vector_path: Path where the generated AOI GeoPackage should
+            be written.
+
+    Raises:
+        ValueError: If any raster used to define the extent has no CRS, or if
+            the rasters do not share any overlapping WGS84 bounds.
+    """
+    raster_paths = _raster_paths_for_full_extent(config)
+    intersection_geom = None
+    for raster_path in raster_paths:
+        with rasterio.open(raster_path) as raster:
+            if raster.crs is None:
+                raise ValueError(
+                    "Raster has no CRS and cannot define an extent: "
+                    f"{raster_path}"
+                )
+            minx, miny, maxx, maxy = transform_bounds(
+                raster.crs,
+                "EPSG:4326",
+                *raster.bounds,
+                densify_pts=21,
+            )
+        raster_extent = box(minx, miny, maxx, maxy)
+        if intersection_geom is None:
+            intersection_geom = raster_extent
+        else:
+            intersection_geom = intersection_geom.intersection(raster_extent)
+
+        if intersection_geom.is_empty:
+            raise ValueError(
+                "No shared raster extent remains after intersecting "
+                f"{raster_path}."
+            )
+
+    target_aoi_vector_path.parent.mkdir(parents=True, exist_ok=True)
+    aoi_gdf = gpd.GeoDataFrame(
+        {"id": [FULL_RASTER_EXTENT_AOI_ID]},
+        geometry=[intersection_geom],
+        crs="EPSG:4326",
+    )
+    aoi_gdf.to_file(target_aoi_vector_path, driver="GPKG")
+
+
 def collect_aoi_files(config: dict) -> dict[str, Path]:
     """Collect AOI files from the patterns.
 
@@ -569,6 +684,15 @@ def collect_aoi_files(config: dict) -> dict[str, Path]:
         ValueError if two or more files share the same stem.
     """
     inputs = config.get("inputs", {})
+    if inputs.get("analyze_full_raster_extent", False):
+        target_aoi_vector_path = (
+            Path(config["work_dir"])
+            / "_generated_aois"
+            / f"{FULL_RASTER_EXTENT_AOI_ID}.gpkg"
+        )
+        create_full_raster_extent_aoi(config, target_aoi_vector_path)
+        return {FULL_RASTER_EXTENT_AOI_ID: target_aoi_vector_path.resolve()}
+
     patterns = inputs.get("aoi_vector_pattern", [])
     if not isinstance(patterns, (list, tuple)):
         patterns = [patterns]
@@ -585,6 +709,13 @@ def collect_aoi_files(config: dict) -> dict[str, Path]:
                     f"  - {path}"
                 )
             aoi_map[stem] = path
+    if not aoi_map:
+        raise ValueError(
+            "No AOI files matched aoi_vector_pattern. To intentionally analyze "
+            "the full overlapping raster extent, set "
+            "inputs.analyze_full_raster_extent: true and leave "
+            "aoi_vector_pattern empty."
+        )
     return aoi_map
 
 
