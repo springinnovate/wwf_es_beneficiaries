@@ -214,15 +214,6 @@ def _as_list(x: Any) -> List[Any]:
     return [x]
 
 
-def _optional_bool(value: Any, key: str) -> bool:
-    """Parse an optional YAML boolean and reject ambiguous values."""
-    if value is None:
-        return False
-    if isinstance(value, bool):
-        return value
-    raise ValueError(f"`{key}` must be true or false, got {value!r}")
-
-
 def process_config(config_path: Path) -> Dict[str, Any]:
     """Parse and validate a YAML file for the beneficiaries workflow.
 
@@ -300,10 +291,12 @@ def process_config(config_path: Path) -> Dict[str, Any]:
         pattern for pattern in _as_list(inputs.get("aoi_vector_pattern", []))
         if pattern
     ]
-    analyze_full_raster_extent = _optional_bool(
-        inputs.get("analyze_full_raster_extent", False),
-        "inputs.analyze_full_raster_extent",
-    )
+    analyze_full_raster_extent = inputs.get("analyze_full_raster_extent", False)
+    if not isinstance(analyze_full_raster_extent, bool):
+        raise ValueError(
+            "`inputs.analyze_full_raster_extent` must be true or false, "
+            f"got {analyze_full_raster_extent!r}"
+        )
 
     wgs84_pixel_size = inputs.get("wgs84_pixel_size", None)
     travel_time_pixel_size_m = inputs.get("travel_time_pixel_size_m", None)
@@ -564,7 +557,18 @@ def print_yaml_config(config):
 
 
 def _raster_paths_for_full_extent(config: dict) -> list[Path]:
-    """Return rasters that constrain the generated full-extent AOI."""
+    """Return rasters that constrain the generated full-extent AOI.
+
+    Args:
+        config: Normalized workflow configuration returned by
+            ``process_config``. The configuration must include input paths for
+            the population, travel-time, and DEM rasters, plus any conditional
+            raster mask sections that should limit the generated AOI extent.
+
+    Returns:
+        Ordered list of unique raster paths whose WGS84 bounds should be
+        intersected to create the generated full-raster AOI.
+    """
     inputs = config["inputs"]
     raster_paths = [
         inputs["population_raster_path"],
@@ -591,28 +595,37 @@ def _raster_paths_for_full_extent(config: dict) -> list[Path]:
     return unique_paths
 
 
-def _raster_extent_as_wgs84_box(raster_path: Path):
-    """Return the raster bounds as a WGS84 shapely box."""
-    with rasterio.open(raster_path) as raster:
-        if raster.crs is None:
-            raise ValueError(
-                f"Raster has no CRS and cannot define an extent: {raster_path}"
-            )
-        minx, miny, maxx, maxy = transform_bounds(
-            raster.crs,
-            "EPSG:4326",
-            *raster.bounds,
-            densify_pts=21,
-        )
-    return box(minx, miny, maxx, maxy)
-
-
 def create_full_raster_extent_aoi(config: dict, target_aoi_vector_path: Path) -> None:
-    """Create an AOI over the shared WGS84 bounds of all analysis rasters."""
+    """Create an AOI over the shared WGS84 bounds of all analysis rasters.
+
+    Args:
+        config: Normalized workflow configuration returned by
+            ``process_config``. The population, travel-time, DEM, and
+            conditional raster paths are used to determine the overlapping
+            raster extent.
+        target_aoi_vector_path: Path where the generated AOI GeoPackage should
+            be written.
+
+    Raises:
+        ValueError: If any raster used to define the extent has no CRS, or if
+            the rasters do not share any overlapping WGS84 bounds.
+    """
     raster_paths = _raster_paths_for_full_extent(config)
     intersection_geom = None
     for raster_path in raster_paths:
-        raster_extent = _raster_extent_as_wgs84_box(raster_path)
+        with rasterio.open(raster_path) as raster:
+            if raster.crs is None:
+                raise ValueError(
+                    "Raster has no CRS and cannot define an extent: "
+                    f"{raster_path}"
+                )
+            minx, miny, maxx, maxy = transform_bounds(
+                raster.crs,
+                "EPSG:4326",
+                *raster.bounds,
+                densify_pts=21,
+            )
+        raster_extent = box(minx, miny, maxx, maxy)
         if intersection_geom is None:
             intersection_geom = raster_extent
         else:
