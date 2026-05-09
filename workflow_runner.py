@@ -47,6 +47,7 @@ import rasterio.mask
 import rasterio.features
 import pyogrio
 from pyproj import CRS, Transformer, Geod
+from tqdm.auto import tqdm
 
 import shortest_distances
 
@@ -910,11 +911,18 @@ def partition_subwatersheds_by_terminal_drain(
         aoi_union = transform(tform, aoi_union)
         aoi_bbox = transform(tform, aoi_bbox)
 
-    attrs = pyogrio.read_dataframe(
-        subwatershed_vector_path,
-        columns=["HYBAS_ID", "NEXT_DOWN", "NEXT_SINK"],
-        read_geometry=False,
-    )
+    with tqdm(
+        total=1,
+        desc="read watershed topology",
+        unit="table",
+        dynamic_ncols=True,
+    ) as progress:
+        attrs = pyogrio.read_dataframe(
+            subwatershed_vector_path,
+            columns=["HYBAS_ID", "NEXT_DOWN", "NEXT_SINK"],
+            read_geometry=False,
+        )
+        progress.update()
     hybas_to_nextdown = dict(
         zip(attrs["HYBAS_ID"].to_numpy(), attrs["NEXT_DOWN"].to_numpy())
     )
@@ -922,11 +930,18 @@ def partition_subwatersheds_by_terminal_drain(
         zip(attrs["HYBAS_ID"].to_numpy(), attrs["NEXT_SINK"].to_numpy())
     )
 
-    sub_bbox_gdf = pyogrio.read_dataframe(
-        subwatershed_vector_path,
-        bbox=aoi_bbox.bounds,
-        columns=["HYBAS_ID", "NEXT_DOWN", "NEXT_SINK", "geometry"],
-    )
+    with tqdm(
+        total=1,
+        desc="read AOI candidate watersheds",
+        unit="table",
+        dynamic_ncols=True,
+    ) as progress:
+        sub_bbox_gdf = pyogrio.read_dataframe(
+            subwatershed_vector_path,
+            bbox=aoi_bbox.bounds,
+            columns=["HYBAS_ID", "NEXT_DOWN", "NEXT_SINK", "geometry"],
+        )
+        progress.update()
     if sub_bbox_gdf.empty:
         raise ValueError(f"No candidates found in bbox for {aoi_vector_path}.")
 
@@ -939,29 +954,54 @@ def partition_subwatersheds_by_terminal_drain(
     ds_ids_to_process = set(initial["NEXT_DOWN"].tolist())
     ds_ids_to_process.discard(0)
 
-    while ds_ids_to_process:
-        visited_ids.update(ds_ids_to_process)
-        next_ids = {
-            hybas_to_nextdown.get(h)
-            for h in ds_ids_to_process
-            if h in hybas_to_nextdown
-        }
-        next_ids.discard(None)
-        next_ids.discard(0)
-        ds_ids_to_process = next_ids - visited_ids
+    with tqdm(
+        desc="collect downstream watersheds",
+        unit="watershed",
+        dynamic_ncols=True,
+    ) as progress:
+        progress.update(len(visited_ids))
+        while ds_ids_to_process:
+            new_downstream_ids = ds_ids_to_process - visited_ids
+            progress.set_postfix(
+                queued=len(ds_ids_to_process),
+                discovered=len(visited_ids) + len(new_downstream_ids),
+                refresh=False,
+            )
+            visited_ids.update(ds_ids_to_process)
+            progress.update(len(new_downstream_ids))
+            next_ids = {
+                hybas_to_nextdown.get(h)
+                for h in ds_ids_to_process
+                if h in hybas_to_nextdown
+            }
+            next_ids.discard(None)
+            next_ids.discard(0)
+            ds_ids_to_process = next_ids - visited_ids
 
     if not visited_ids:
         raise ValueError(f"No valid geometry found for {aoi_vector_path}.")
 
     ids_by_next_sink = collections.defaultdict(set)
-    for hybas_id in visited_ids:
+    for hybas_id in tqdm(
+        visited_ids,
+        desc="group watersheds by sink",
+        unit="watershed",
+        dynamic_ncols=True,
+    ):
         next_sink_id = hybas_to_nextsink.get(hybas_id)
         if next_sink_id is None or pd.isna(next_sink_id):
             raise ValueError(f"Could not find NEXT_SINK for HYBAS_ID {hybas_id}.")
         ids_by_next_sink[next_sink_id].add(hybas_id)
 
     downstream_features = []
-    for id_chunk in _chunks(sorted(visited_ids), 1000):
+    total_chunks = (len(visited_ids) + 999) // 1000
+    for id_chunk in tqdm(
+        _chunks(sorted(visited_ids), 1000),
+        desc="read downstream watershed geometries",
+        total=total_chunks,
+        unit="chunk",
+        dynamic_ncols=True,
+    ):
         where = f'HYBAS_ID IN ({",".join(map(str, id_chunk))})'
         df = pyogrio.read_dataframe(
             subwatershed_vector_path,
@@ -996,7 +1036,13 @@ def partition_subwatersheds_by_terminal_drain(
     target_partition_dir.mkdir(parents=True, exist_ok=True)
 
     partition_paths = {}
-    for next_sink_id, partition_ids in sorted(ids_by_next_sink.items()):
+    partition_items = sorted(ids_by_next_sink.items())
+    for next_sink_id, partition_ids in tqdm(
+        partition_items,
+        desc="write drain partitions",
+        unit="partition",
+        dynamic_ncols=True,
+    ):
         partition_id = f"drain_{next_sink_id}"
         partition_path = target_partition_dir / f"{partition_id}.gpkg"
         partition_gdf = sub_gdf[sub_gdf["HYBAS_ID"].isin(partition_ids)].copy()
