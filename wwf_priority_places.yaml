@@ -7,11 +7,6 @@ focal_vectors:
     is_marine: true
     buffer_distance_m: 5000
     max_proposed_priority_area_ha: 1000000
-  - id: southernAfrica
-    path: data/priorityPlaces/southernAfrica
-    is_marine: false
-    max_proposed_priority_area_ha: 1000000
-    buffer_distance_m: 500000
 
   - id: amazon
     path: data/priorityPlaces/amazon
