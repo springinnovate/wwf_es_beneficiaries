@@ -505,7 +505,11 @@ def validate_paths(config: Dict[str, Any]) -> None:
             )
         else:
             subwatershed_fields = set(subwatershed_info.get("fields", []))
-            missing_fields = {"HYBAS_ID", "NEXT_DOWN"} - subwatershed_fields
+            missing_fields = {
+                "HYBAS_ID",
+                "NEXT_DOWN",
+                "NEXT_SINK",
+            } - subwatershed_fields
             if missing_fields:
                 issues.append(
                     (
@@ -729,31 +733,6 @@ def subset_subwatersheds(
     logger.info(f"all done subwatershedding {aoi_vector_path}")
 
 
-def _terminal_drain_for_hybas(hybas_id, hybas_to_nextdown):
-    """Return the terminal drain HYBAS_ID for a subwatershed."""
-    visited_ids = set()
-    current_id = hybas_id
-    while True:
-        if current_id in visited_ids:
-            raise ValueError(
-                f"Cycle detected while following NEXT_DOWN from {hybas_id}."
-            )
-        visited_ids.add(current_id)
-        next_down = hybas_to_nextdown.get(current_id)
-        if next_down is None or pd.isna(next_down):
-            raise ValueError(
-                f"Could not find NEXT_DOWN target for HYBAS_ID {current_id}."
-            )
-        if next_down == 0:
-            return current_id
-        current_id = next_down
-
-
-def _drain_partition_id(terminal_drain_id) -> str:
-    """Return a stable partition id for a terminal drain."""
-    return f"drain_{terminal_drain_id}"
-
-
 def partition_subwatersheds_by_terminal_drain(
     aoi_vector_path: str | Path,
     subwatershed_vector_path: str | Path,
@@ -765,19 +744,19 @@ def partition_subwatersheds_by_terminal_drain(
     Args:
         aoi_vector_path: Path to the AOI vector dataset.
         subwatershed_vector_path: Path to a HydroBASINS-style vector dataset
-            containing ``HYBAS_ID`` and ``NEXT_DOWN`` columns.
+            containing ``HYBAS_ID``, ``NEXT_DOWN``, and ``NEXT_SINK`` columns.
         target_crs: CRS to use for the written partition vectors.
         target_partition_dir: Directory where partition GeoPackages should be
             written.
 
     Returns:
         Mapping from partition id to the written partition vector path. Each
-        partition contains downstream subwatersheds that drain to one terminal
-        basin where ``NEXT_DOWN == 0``.
+        partition contains downstream subwatersheds with the same
+        ``NEXT_SINK`` id.
 
     Raises:
-        ValueError: If the AOI does not intersect subwatersheds, the
-            downstream graph is incomplete, or a NEXT_DOWN cycle is detected.
+        ValueError: If the AOI does not intersect subwatersheds or the
+            downstream graph is incomplete.
     """
     logger = logging.getLogger(__name__)
     logger.info(f"partitioning downstream subwatersheds from {aoi_vector_path}")
@@ -802,17 +781,20 @@ def partition_subwatersheds_by_terminal_drain(
 
     attrs = pyogrio.read_dataframe(
         subwatershed_vector_path,
-        columns=["HYBAS_ID", "NEXT_DOWN"],
+        columns=["HYBAS_ID", "NEXT_DOWN", "NEXT_SINK"],
         read_geometry=False,
     )
     hybas_to_nextdown = dict(
         zip(attrs["HYBAS_ID"].to_numpy(), attrs["NEXT_DOWN"].to_numpy())
     )
+    hybas_to_nextsink = dict(
+        zip(attrs["HYBAS_ID"].to_numpy(), attrs["NEXT_SINK"].to_numpy())
+    )
 
     sub_bbox_gdf = pyogrio.read_dataframe(
         subwatershed_vector_path,
         bbox=aoi_bbox.bounds,
-        columns=["HYBAS_ID", "NEXT_DOWN", "geometry"],
+        columns=["HYBAS_ID", "NEXT_DOWN", "NEXT_SINK", "geometry"],
     )
     if sub_bbox_gdf.empty:
         raise ValueError(f"No candidates found in bbox for {aoi_vector_path}.")
@@ -840,10 +822,12 @@ def partition_subwatersheds_by_terminal_drain(
     if not visited_ids:
         raise ValueError(f"No valid geometry found for {aoi_vector_path}.")
 
-    ids_by_terminal_drain = collections.defaultdict(set)
+    ids_by_next_sink = collections.defaultdict(set)
     for hybas_id in visited_ids:
-        terminal_drain_id = _terminal_drain_for_hybas(hybas_id, hybas_to_nextdown)
-        ids_by_terminal_drain[terminal_drain_id].add(hybas_id)
+        next_sink_id = hybas_to_nextsink.get(hybas_id)
+        if next_sink_id is None or pd.isna(next_sink_id):
+            raise ValueError(f"Could not find NEXT_SINK for HYBAS_ID {hybas_id}.")
+        ids_by_next_sink[next_sink_id].add(hybas_id)
 
     downstream_features = []
     for id_chunk in _chunks(sorted(visited_ids), 1000):
@@ -881,14 +865,12 @@ def partition_subwatersheds_by_terminal_drain(
     target_partition_dir.mkdir(parents=True, exist_ok=True)
 
     partition_paths = {}
-    for terminal_drain_id, partition_ids in sorted(ids_by_terminal_drain.items()):
-        partition_id = _drain_partition_id(terminal_drain_id)
+    for next_sink_id, partition_ids in sorted(ids_by_next_sink.items()):
+        partition_id = f"drain_{next_sink_id}"
         partition_path = target_partition_dir / f"{partition_id}.gpkg"
         partition_gdf = sub_gdf[sub_gdf["HYBAS_ID"].isin(partition_ids)].copy()
         if partition_gdf.empty:
-            raise ValueError(
-                f"No geometries found for terminal drain {terminal_drain_id}."
-            )
+            raise ValueError(f"No geometries found for NEXT_SINK {next_sink_id}.")
         partition_gdf.to_file(partition_path, driver="GPKG")
         partition_paths[partition_id] = partition_path
 
@@ -1579,9 +1561,8 @@ def main() -> None:
                     task_name=f"clip base data for {aoi_key} {partition_id}",
                 )
 
-                target_flow_dir_raster_path = "%s_mfdflow%s" % os.path.splitext(
-                    str(clipped_dem_path)
-                )
+                dem_path_root, dem_path_ext = os.path.splitext(str(clipped_dem_path))
+                target_flow_dir_raster_path = f"{dem_path_root}_mfdflow{dem_path_ext}"
                 flow_dir_task = task_graph.add_task(
                     func=calc_flow_dir,
                     args=(
