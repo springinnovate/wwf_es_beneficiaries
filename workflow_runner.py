@@ -1253,7 +1253,7 @@ def combine_pops(
 
 
 def calculate_taskgraph_worker_count(config: dict, aoi_count: int) -> int:
-    """Calculate a conservative TaskGraph worker count for this workflow.
+    """Calculate a TaskGraph worker count from available workflow fanout.
 
     Args:
         config: Normalized workflow configuration returned by
@@ -1262,21 +1262,18 @@ def calculate_taskgraph_worker_count(config: dict, aoi_count: int) -> int:
 
     Returns:
         Worker count bounded by the physical CPU count. The value is at least
-        one and accounts for both AOI-level fanout and per-AOI mask fanout.
+        one and adds two extra slots when travel-time work can run alongside
+        AOI downstream preparation.
     """
     physical_cpu_count = psutil.cpu_count(logical=False) or psutil.cpu_count() or 1
-    masks = config.get("masks", [])
-    mask_count = len(masks)
     has_travel_time_mask = any(
-        mask.get("type") == "travel_time_population" for mask in masks
+        mask.get("type") == "travel_time_population"
+        for mask in config.get("masks", [])
     )
 
-    per_aoi_parallelism = mask_count
+    desired_worker_count = max(1, aoi_count)
     if has_travel_time_mask:
-        # Travel-time tasks can run while the downstream prep chain proceeds.
-        per_aoi_parallelism = max(per_aoi_parallelism, 2)
-
-    desired_worker_count = max(1, aoi_count, per_aoi_parallelism)
+        desired_worker_count += 2
     return min(desired_worker_count, physical_cpu_count)
 
 
