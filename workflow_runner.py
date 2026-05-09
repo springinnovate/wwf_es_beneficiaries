@@ -843,9 +843,7 @@ def partition_subwatersheds_by_terminal_drain(
 
     ids_by_terminal_drain = collections.defaultdict(set)
     for hybas_id in visited_ids:
-        terminal_drain_id = _terminal_drain_for_hybas(
-            hybas_id, hybas_to_nextdown
-        )
+        terminal_drain_id = _terminal_drain_for_hybas(hybas_id, hybas_to_nextdown)
         ids_by_terminal_drain[terminal_drain_id].add(hybas_id)
 
     downstream_features = []
@@ -1464,8 +1462,7 @@ def calculate_taskgraph_worker_count(config: dict, work_unit_count: int) -> int:
     """
     physical_cpu_count = psutil.cpu_count(logical=False) or psutil.cpu_count() or 1
     has_travel_time_mask = any(
-        mask.get("type") == "travel_time_population"
-        for mask in config.get("masks", [])
+        mask.get("type") == "travel_time_population" for mask in config.get("masks", [])
     )
 
     desired_worker_count = max(1, work_unit_count)
@@ -1525,7 +1522,9 @@ def main() -> None:
         }
         if has_conditional_mask:
             logger.info(
-                "found %d drain partitions for %s", len(partition_paths), aoi_key
+                "found %d drain partitions for %s",
+                len(partition_paths),
+                aoi_key,
             )
 
     work_unit_count = sum(
@@ -1636,12 +1635,16 @@ def main() -> None:
             elif mask_section["type"] == "conditional_raster":
                 partition_pop_id_raster_list = []
                 partition_pop_tasks = []
-                for partition_id, partition_context in partition_contexts.items():
+                for (
+                    partition_id,
+                    partition_context,
+                ) in partition_contexts.items():
                     if len(partition_contexts) == 1:
                         partition_pop_raster_path = target_pop_raster_path
                     else:
                         partition_pop_raster_path = (
-                            output_dir / f"{aoi_key}_{partition_id}_{section_id}_pop.tif"
+                            output_dir
+                            / f"{aoi_key}_{partition_id}_{section_id}_pop.tif"
                         )
                     partition_pop_id_raster_list.append(
                         (partition_id, partition_pop_raster_path)
