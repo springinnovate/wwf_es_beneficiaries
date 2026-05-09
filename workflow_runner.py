@@ -475,7 +475,7 @@ def validate_paths(config: Dict[str, Any]) -> None:
         if any(ch in path_str for ch in ["*", "?", "["]):
             # skip globs
             return
-        if not Path(path_str).exists():
+        if not os.path.exists(path_str):
             issues.append((label, f"not found: {path_str}"))
 
     inputs = config.get("inputs", {})
@@ -750,9 +750,8 @@ def _terminal_drain_for_hybas(hybas_id, hybas_to_nextdown):
 
 
 def _drain_partition_id(terminal_drain_id) -> str:
-    """Return a filesystem-safe partition id for a terminal drain."""
-    safe_id = str(terminal_drain_id).replace("-", "neg_").replace(".", "_")
-    return f"drain_{safe_id}"
+    """Return a stable partition id for a terminal drain."""
+    return f"drain_{terminal_drain_id}"
 
 
 def partition_subwatersheds_by_terminal_drain(
