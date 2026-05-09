@@ -471,13 +471,12 @@ def validate_paths(config: Dict[str, Any]) -> None:
         if not path_like:
             issues.append((label, "missing"))
             return
-        if isinstance(path_like, str) and any(
-            ch in path_like for ch in ["*", "?", "["]
-        ):
+        path_str = os.fspath(path_like)
+        if any(ch in path_str for ch in ["*", "?", "["]):
             # skip globs
             return
-        if isinstance(path_like, str) and not Path(path_like).exists():
-            issues.append((label, f"not found: {path_like}"))
+        if not Path(path_str).exists():
+            issues.append((label, f"not found: {path_str}"))
 
     inputs = config.get("inputs", {})
     for label in [
@@ -492,6 +491,29 @@ def validate_paths(config: Dict[str, Any]) -> None:
         for key, val in params.items():
             if key.endswith("_path"):
                 _check(val, f"mask[{i}].params.{key}")
+
+    subwatershed_vector_path = inputs.get("subwatershed_vector_path")
+    if subwatershed_vector_path and Path(subwatershed_vector_path).exists():
+        try:
+            subwatershed_info = pyogrio.read_info(subwatershed_vector_path)
+        except Exception as error:
+            issues.append(
+                (
+                    "subwatershed_vector_path",
+                    f"could not read vector metadata: {error}",
+                )
+            )
+        else:
+            subwatershed_fields = set(subwatershed_info.get("fields", []))
+            missing_fields = {"HYBAS_ID", "NEXT_DOWN"} - subwatershed_fields
+            if missing_fields:
+                issues.append(
+                    (
+                        "subwatershed_vector_path",
+                        "missing required field(s): "
+                        + ", ".join(sorted(missing_fields)),
+                    )
+                )
 
     if issues:
         formatted = "\n".join(f"- {label}: {msg}" for label, msg in issues)
@@ -705,6 +727,180 @@ def subset_subwatersheds(
     sub_gdf = sub_gdf.to_crs(target_crs.crs)
     sub_gdf.to_file(target_subset_subwatersheds_vector_path, driver="GPKG")
     logger.info(f"all done subwatershedding {aoi_vector_path}")
+
+
+def _terminal_drain_for_hybas(hybas_id, hybas_to_nextdown):
+    """Return the terminal drain HYBAS_ID for a subwatershed."""
+    visited_ids = set()
+    current_id = hybas_id
+    while True:
+        if current_id in visited_ids:
+            raise ValueError(
+                f"Cycle detected while following NEXT_DOWN from {hybas_id}."
+            )
+        visited_ids.add(current_id)
+        next_down = hybas_to_nextdown.get(current_id)
+        if next_down is None or pd.isna(next_down):
+            raise ValueError(
+                f"Could not find NEXT_DOWN target for HYBAS_ID {current_id}."
+            )
+        if next_down == 0:
+            return current_id
+        current_id = next_down
+
+
+def _drain_partition_id(terminal_drain_id) -> str:
+    """Return a filesystem-safe partition id for a terminal drain."""
+    safe_id = str(terminal_drain_id).replace("-", "neg_").replace(".", "_")
+    return f"drain_{safe_id}"
+
+
+def partition_subwatersheds_by_terminal_drain(
+    aoi_vector_path: str | Path,
+    subwatershed_vector_path: str | Path,
+    target_crs: PickedCRS,
+    target_partition_dir: str | Path,
+) -> dict[str, Path]:
+    """Write downstream subwatershed partitions grouped by terminal drain.
+
+    Args:
+        aoi_vector_path: Path to the AOI vector dataset.
+        subwatershed_vector_path: Path to a HydroBASINS-style vector dataset
+            containing ``HYBAS_ID`` and ``NEXT_DOWN`` columns.
+        target_crs: CRS to use for the written partition vectors.
+        target_partition_dir: Directory where partition GeoPackages should be
+            written.
+
+    Returns:
+        Mapping from partition id to the written partition vector path. Each
+        partition contains downstream subwatersheds that drain to one terminal
+        basin where ``NEXT_DOWN == 0``.
+
+    Raises:
+        ValueError: If the AOI does not intersect subwatersheds, the
+            downstream graph is incomplete, or a NEXT_DOWN cycle is detected.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"partitioning downstream subwatersheds from {aoi_vector_path}")
+
+    aoi_gdf = gpd.read_file(aoi_vector_path)
+    aoi_crs = aoi_gdf.crs
+    aoi_gdf = aoi_gdf.set_geometry(aoi_gdf.geometry.make_valid())
+    aoi_union = aoi_gdf.geometry.union_all()
+    aoi_bbox = box(*aoi_gdf.total_bounds)
+
+    subwatershed_info = pyogrio.read_info(subwatershed_vector_path)
+    sub_crs = (
+        CRS.from_user_input(subwatershed_info.get("crs"))
+        if subwatershed_info.get("crs")
+        else aoi_crs
+    )
+
+    if aoi_crs != sub_crs:
+        tform = Transformer.from_crs(aoi_crs, sub_crs, always_xy=True).transform
+        aoi_union = transform(tform, aoi_union)
+        aoi_bbox = transform(tform, aoi_bbox)
+
+    attrs = pyogrio.read_dataframe(
+        subwatershed_vector_path,
+        columns=["HYBAS_ID", "NEXT_DOWN"],
+        read_geometry=False,
+    )
+    hybas_to_nextdown = dict(
+        zip(attrs["HYBAS_ID"].to_numpy(), attrs["NEXT_DOWN"].to_numpy())
+    )
+
+    sub_bbox_gdf = pyogrio.read_dataframe(
+        subwatershed_vector_path,
+        bbox=aoi_bbox.bounds,
+        columns=["HYBAS_ID", "NEXT_DOWN", "geometry"],
+    )
+    if sub_bbox_gdf.empty:
+        raise ValueError(f"No candidates found in bbox for {aoi_vector_path}.")
+
+    hits = sub_bbox_gdf.sindex.query(aoi_union, predicate="intersects")
+    if len(hits) == 0:
+        raise ValueError(f"No intersecting sub-watersheds for {aoi_vector_path}.")
+
+    initial = sub_bbox_gdf.iloc[hits]
+    visited_ids = set(initial["HYBAS_ID"].tolist())
+    ds_ids_to_process = set(initial["NEXT_DOWN"].tolist())
+    ds_ids_to_process.discard(0)
+
+    while ds_ids_to_process:
+        visited_ids.update(ds_ids_to_process)
+        next_ids = {
+            hybas_to_nextdown.get(h)
+            for h in ds_ids_to_process
+            if h in hybas_to_nextdown
+        }
+        next_ids.discard(None)
+        next_ids.discard(0)
+        ds_ids_to_process = next_ids - visited_ids
+
+    if not visited_ids:
+        raise ValueError(f"No valid geometry found for {aoi_vector_path}.")
+
+    ids_by_terminal_drain = collections.defaultdict(set)
+    for hybas_id in visited_ids:
+        terminal_drain_id = _terminal_drain_for_hybas(
+            hybas_id, hybas_to_nextdown
+        )
+        ids_by_terminal_drain[terminal_drain_id].add(hybas_id)
+
+    downstream_features = []
+    for id_chunk in _chunks(sorted(visited_ids), 1000):
+        where = f'HYBAS_ID IN ({",".join(map(str, id_chunk))})'
+        df = pyogrio.read_dataframe(
+            subwatershed_vector_path,
+            where=where,
+            columns=None,
+        )
+        downstream_features.append(df)
+
+    if not downstream_features:
+        raise ValueError(f"No geometries returned for {aoi_vector_path}.")
+
+    sub_gdf = pd.concat(downstream_features, ignore_index=True)
+    sub_gdf = gpd.GeoDataFrame(sub_gdf, crs=sub_crs)
+    sub_gdf = sub_gdf.drop_duplicates(subset=["HYBAS_ID"])
+
+    invalid = ~sub_gdf.geometry.is_valid
+    if invalid.any():
+        if hasattr(sub_gdf.geometry, "make_valid"):
+            sub_gdf.loc[invalid, "geometry"] = sub_gdf.loc[
+                invalid, "geometry"
+            ].make_valid()
+        else:
+            sub_gdf.loc[invalid, "geometry"] = sub_gdf.loc[invalid, "geometry"].buffer(
+                0
+            )
+
+    if sub_crs and aoi_crs and sub_crs != aoi_crs:
+        sub_gdf = sub_gdf.to_crs(aoi_crs)
+    sub_gdf = sub_gdf.to_crs(target_crs.crs)
+
+    target_partition_dir = Path(target_partition_dir)
+    target_partition_dir.mkdir(parents=True, exist_ok=True)
+
+    partition_paths = {}
+    for terminal_drain_id, partition_ids in sorted(ids_by_terminal_drain.items()):
+        partition_id = _drain_partition_id(terminal_drain_id)
+        partition_path = target_partition_dir / f"{partition_id}.gpkg"
+        partition_gdf = sub_gdf[sub_gdf["HYBAS_ID"].isin(partition_ids)].copy()
+        if partition_gdf.empty:
+            raise ValueError(
+                f"No geometries found for terminal drain {terminal_drain_id}."
+            )
+        partition_gdf.to_file(partition_path, driver="GPKG")
+        partition_paths[partition_id] = partition_path
+
+    logger.info(
+        "wrote %d drain partitions for %s",
+        len(partition_paths),
+        aoi_vector_path,
+    )
+    return partition_paths
 
 
 def align_and_resize_raster_stack_on_vector(
@@ -1252,13 +1448,14 @@ def combine_pops(
     return aligned_pop_sums_by_id
 
 
-def calculate_taskgraph_worker_count(config: dict, aoi_count: int) -> int:
+def calculate_taskgraph_worker_count(config: dict, work_unit_count: int) -> int:
     """Calculate a TaskGraph worker count from available workflow fanout.
 
     Args:
         config: Normalized workflow configuration returned by
             ``process_config``.
-        aoi_count: Number of AOIs that will be processed.
+        work_unit_count: Number of independent AOI or drain-partition work
+            units that will be processed.
 
     Returns:
         Worker count bounded by the physical CPU count. The value is at least
@@ -1271,7 +1468,7 @@ def calculate_taskgraph_worker_count(config: dict, aoi_count: int) -> int:
         for mask in config.get("masks", [])
     )
 
-    desired_worker_count = max(1, aoi_count)
+    desired_worker_count = max(1, work_unit_count)
     if has_travel_time_mask:
         desired_worker_count += 2
     return min(desired_worker_count, physical_cpu_count)
@@ -1301,7 +1498,42 @@ def main() -> None:
     aoi_id_to_path = collect_aoi_files(config)
     logger.info(f"found {len(aoi_id_to_path)} aois to process")
 
-    n_workers = calculate_taskgraph_worker_count(config, len(aoi_id_to_path))
+    wgs84_pixel_size = config["inputs"]["wgs84_pixel_size"]
+    has_conditional_mask = any(
+        mask.get("type") == "conditional_raster" for mask in config.get("masks", [])
+    )
+
+    aoi_work_items = {}
+    for aoi_key, aoi_vector_path in aoi_id_to_path.items():
+        working_dir = Path(config["work_dir"]) / Path(aoi_key)
+        working_dir.mkdir(parents=True, exist_ok=True)
+        picked_crs = choose_equidistant_crs_from_bbox(aoi_vector_path)
+        if has_conditional_mask:
+            partition_paths = partition_subwatersheds_by_terminal_drain(
+                aoi_vector_path,
+                config["inputs"]["subwatershed_vector_path"],
+                picked_crs,
+                working_dir / "drain_partitions",
+            )
+        else:
+            partition_paths = {}
+        aoi_work_items[aoi_key] = {
+            "aoi_vector_path": aoi_vector_path,
+            "target_crs": picked_crs,
+            "working_dir": working_dir,
+            "partition_paths": partition_paths,
+        }
+        if has_conditional_mask:
+            logger.info(
+                "found %d drain partitions for %s", len(partition_paths), aoi_key
+            )
+
+    work_unit_count = sum(
+        len(item["partition_paths"]) for item in aoi_work_items.values()
+    )
+    if not has_conditional_mask:
+        work_unit_count = len(aoi_work_items)
+    n_workers = calculate_taskgraph_worker_count(config, work_unit_count)
     update_rate = 15.0
     logger.info("using %d TaskGraph workers", n_workers)
 
@@ -1309,78 +1541,73 @@ def main() -> None:
     logging.getLogger("ecoshard").setLevel(config["logging"]["level"])
     logging.basicConfig()
 
-    # these drive how we cut, reproject, and determine distance
-    wgs84_pixel_size = config["inputs"]["wgs84_pixel_size"]
-
-    good_crs_for_aoi = {}
-    for aoi_key, aoi_vector_path in aoi_id_to_path.items():
-        crs_task = task_graph.add_task(
-            func=choose_equidistant_crs_from_bbox,
-            args=(aoi_vector_path,),
-            store_result=True,
-            task_name=f"calculate CRS for {aoi_key}",
-        )
-        good_crs_for_aoi[aoi_key] = crs_task
-
     section_mask_ids = set()
+    combined_header = "combined pop"
+    section_mask_ids.add(combined_header)
     pop_results = collections.defaultdict(dict)
-    for aoi_key, aoi_vector_path in aoi_id_to_path.items():
-        working_dir = Path(config["work_dir"]) / Path(aoi_key)
-        working_dir.mkdir(parents=True, exist_ok=True)
-        target_subwatershed_path = working_dir / Path(
-            f"downstream_watersheds_from_{aoi_key}.gpkg"
-        )
-        subset_task = task_graph.add_task(
-            func=subset_subwatersheds,
-            args=(
-                aoi_vector_path,
-                config["inputs"]["subwatershed_vector_path"],
-                good_crs_for_aoi[aoi_key].get(),
-                target_subwatershed_path,
-            ),
-            target_path_list=[target_subwatershed_path],
-            task_name=f"subset downstream from {aoi_key}",
-        )
-        wgs84_pixel_size = config["inputs"]["wgs84_pixel_size"]
+    for aoi_key, aoi_info in aoi_work_items.items():
+        aoi_vector_path = aoi_info["aoi_vector_path"]
+        working_dir = aoi_info["working_dir"]
         base_raster_path_list = [
             config["inputs"]["population_raster_path"],
             config["inputs"]["dem_raster_path"],
         ]
-        target_clipped_raster_path_list = [
-            str(working_dir / f"{Path(path).stem}_clipped.tif")
-            for path in base_raster_path_list
-        ]
 
-        clipped_pop_raster_path = target_clipped_raster_path_list[0]
-        clipped_dem_path = target_clipped_raster_path_list[1]
+        partition_contexts = {}
+        if has_conditional_mask:
+            for partition_id, partition_vector_path in aoi_info[
+                "partition_paths"
+            ].items():
+                partition_working_dir = working_dir / partition_id
+                partition_working_dir.mkdir(parents=True, exist_ok=True)
+                target_clipped_raster_path_list = [
+                    str(partition_working_dir / f"{Path(path).stem}_clipped.tif")
+                    for path in base_raster_path_list
+                ]
 
-        clip_task = task_graph.add_task(
-            func=align_and_resize_raster_stack_on_vector,
-            args=(
-                base_raster_path_list,
-                target_clipped_raster_path_list,
-                ["near"] * len(base_raster_path_list),
-                [wgs84_pixel_size, -wgs84_pixel_size],
-                target_subwatershed_path,
-            ),
-            dependent_task_list=[subset_task],
-            target_path_list=target_clipped_raster_path_list,
-            task_name=f"clip base data for {aoi_key}",
-        )
+                clipped_pop_raster_path = target_clipped_raster_path_list[0]
+                clipped_dem_path = target_clipped_raster_path_list[1]
 
-        target_flow_dir_raster_path = "%s_mfdflow%s" % os.path.splitext(
-            str(clipped_dem_path)
-        )
-        flow_dir_task = task_graph.add_task(
-            func=calc_flow_dir,
-            args=(clipped_dem_path, working_dir, target_flow_dir_raster_path),
-            dependent_task_list=[clip_task],
-            target_path_list=[target_flow_dir_raster_path],
-            task_name=f"calculate flow dir for {aoi_key}",
-        )
+                clip_task = task_graph.add_task(
+                    func=align_and_resize_raster_stack_on_vector,
+                    args=(
+                        base_raster_path_list,
+                        target_clipped_raster_path_list,
+                        ["near"] * len(base_raster_path_list),
+                        [wgs84_pixel_size, -wgs84_pixel_size],
+                        partition_vector_path,
+                    ),
+                    target_path_list=target_clipped_raster_path_list,
+                    task_name=f"clip base data for {aoi_key} {partition_id}",
+                )
+
+                target_flow_dir_raster_path = "%s_mfdflow%s" % os.path.splitext(
+                    str(clipped_dem_path)
+                )
+                flow_dir_task = task_graph.add_task(
+                    func=calc_flow_dir,
+                    args=(
+                        clipped_dem_path,
+                        partition_working_dir,
+                        target_flow_dir_raster_path,
+                    ),
+                    dependent_task_list=[clip_task],
+                    target_path_list=[target_flow_dir_raster_path],
+                    task_name=f"calculate flow dir for {aoi_key} {partition_id}",
+                )
+                partition_contexts[partition_id] = {
+                    "clipped_pop_raster_path": Path(clipped_pop_raster_path),
+                    "flow_dir_raster_path": Path(target_flow_dir_raster_path),
+                    "flow_dir_task": flow_dir_task,
+                    "working_dir": partition_working_dir,
+                }
+            if not partition_contexts:
+                raise ValueError(
+                    f"No drain partitions were found for conditional AOI {aoi_key}."
+                )
 
         pop_id_raster_list = []
-        pop_raster_tasks = []
+        section_pop_raster_tasks = []
         for mask_section in config["masks"]:
             section_id = mask_section["id"]
             section_mask_ids.add(section_id)
@@ -1397,7 +1624,7 @@ def main() -> None:
                         config["inputs"]["population_raster_path"],
                         aoi_vector_path,
                         mask_section["params"]["max_hours"],
-                        good_crs_for_aoi[aoi_key].get().crs,
+                        aoi_info["target_crs"].crs,
                         target_pop_raster_path,
                         travel_time_working_dir,
                     ),
@@ -1405,32 +1632,67 @@ def main() -> None:
                     target_path_list=[target_pop_raster_path],
                     task_name=f"travel time for {aoi_key}",
                 )
-                pop_raster_tasks.append(travel_task)
+                section_pop_raster_tasks.append(travel_task)
             elif mask_section["type"] == "conditional_raster":
-                conditional_task = task_graph.add_task(
-                    func=calculate_ds_pop_from_conditional_raster,
-                    args=(
-                        aoi_vector_path,
-                        Path(target_flow_dir_raster_path),
-                        Path(clipped_pop_raster_path),
-                        Path(mask_section["params"]["condition_raster_path"]),
-                        section_id,
-                        mask_section["params"]["expression"],
-                        config["inputs"]["buffer_size_m"],
-                        mask_section["params"].get("max_downstream_distance_m", None),
-                        config["inputs"]["travel_time_pixel_size_m"],
-                        working_dir,
-                        target_pop_raster_path,
-                    ),
-                    dependent_task_list=[flow_dir_task],
-                    store_result=True,
-                    target_path_list=[target_pop_raster_path],
-                    task_name=f"conditional downstream {section_id}",
-                )
-                pop_raster_tasks.append(conditional_task)
+                partition_pop_id_raster_list = []
+                partition_pop_tasks = []
+                for partition_id, partition_context in partition_contexts.items():
+                    if len(partition_contexts) == 1:
+                        partition_pop_raster_path = target_pop_raster_path
+                    else:
+                        partition_pop_raster_path = (
+                            output_dir / f"{aoi_key}_{partition_id}_{section_id}_pop.tif"
+                        )
+                    partition_pop_id_raster_list.append(
+                        (partition_id, partition_pop_raster_path)
+                    )
+                    conditional_task = task_graph.add_task(
+                        func=calculate_ds_pop_from_conditional_raster,
+                        args=(
+                            aoi_vector_path,
+                            partition_context["flow_dir_raster_path"],
+                            partition_context["clipped_pop_raster_path"],
+                            Path(mask_section["params"]["condition_raster_path"]),
+                            section_id,
+                            mask_section["params"]["expression"],
+                            config["inputs"]["buffer_size_m"],
+                            mask_section["params"].get(
+                                "max_downstream_distance_m", None
+                            ),
+                            config["inputs"]["travel_time_pixel_size_m"],
+                            partition_context["working_dir"],
+                            partition_pop_raster_path,
+                        ),
+                        dependent_task_list=[partition_context["flow_dir_task"]],
+                        store_result=True,
+                        target_path_list=[partition_pop_raster_path],
+                        task_name=(
+                            f"conditional downstream {section_id} "
+                            f"for {aoi_key} {partition_id}"
+                        ),
+                    )
+                    partition_pop_tasks.append(conditional_task)
+
+                if len(partition_contexts) == 1:
+                    section_pop_raster_tasks.append(partition_pop_tasks[0])
+                else:
+                    section_combine_task = task_graph.add_task(
+                        func=combine_pops,
+                        args=(
+                            partition_pop_id_raster_list,
+                            wgs84_pixel_size,
+                            working_dir / f"combine_{section_id}",
+                            target_pop_raster_path,
+                        ),
+                        dependent_task_list=partition_pop_tasks,
+                        store_result=True,
+                        target_path_list=[target_pop_raster_path],
+                        task_name=f"combine partitions for {aoi_key} {section_id}",
+                    )
+                    section_pop_raster_tasks.append(section_combine_task)
             else:
                 raise ValueError(f"unknown mask section type: {mask_section['type']}")
-        task_graph.join()
+
         target_combined_pop_raster_path = output_dir / f"{aoi_key}_total_pop.tif"
         combined_task = task_graph.add_task(
             func=combine_pops,
@@ -1440,13 +1702,11 @@ def main() -> None:
                 working_dir,
                 target_combined_pop_raster_path,
             ),
-            dependent_task_list=pop_raster_tasks,
+            dependent_task_list=section_pop_raster_tasks,
             store_result=True,
             target_path_list=[target_combined_pop_raster_path],
             task_name=f"combined pop for {aoi_key}",
         )
-        combined_header = "combined pop"
-        section_mask_ids.add(combined_header)
         pop_results[aoi_key][combined_header] = combined_task
 
     task_graph.join()
