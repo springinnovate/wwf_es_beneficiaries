@@ -1137,7 +1137,7 @@ def calculate_ds_pop_from_conditional_raster(
             return (
                 (n_pixels > 0)
                 & mask.astype(bool)
-                & (travel_time_pixel_size_m <= max_downstream_distance_m)
+                & (n_pixels * travel_time_pixel_size_m <= max_downstream_distance_m)
             )
 
         distance_transform_raster_path = str(
