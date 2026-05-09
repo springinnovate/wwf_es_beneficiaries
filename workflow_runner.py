@@ -1252,6 +1252,34 @@ def combine_pops(
     return aligned_pop_sums_by_id
 
 
+def calculate_taskgraph_worker_count(config: dict, aoi_count: int) -> int:
+    """Calculate a conservative TaskGraph worker count for this workflow.
+
+    Args:
+        config: Normalized workflow configuration returned by
+            ``process_config``.
+        aoi_count: Number of AOIs that will be processed.
+
+    Returns:
+        Worker count bounded by the physical CPU count. The value is at least
+        one and accounts for both AOI-level fanout and per-AOI mask fanout.
+    """
+    physical_cpu_count = psutil.cpu_count(logical=False) or psutil.cpu_count() or 1
+    masks = config.get("masks", [])
+    mask_count = len(masks)
+    has_travel_time_mask = any(
+        mask.get("type") == "travel_time_population" for mask in masks
+    )
+
+    per_aoi_parallelism = mask_count
+    if has_travel_time_mask:
+        # Travel-time tasks can run while the downstream prep chain proceeds.
+        per_aoi_parallelism = max(per_aoi_parallelism, 2)
+
+    desired_worker_count = max(1, aoi_count, per_aoi_parallelism)
+    return min(desired_worker_count, physical_cpu_count)
+
+
 def main() -> None:
     """Entry point."""
     ap = argparse.ArgumentParser(
@@ -1276,8 +1304,9 @@ def main() -> None:
     aoi_id_to_path = collect_aoi_files(config)
     logger.info(f"found {len(aoi_id_to_path)} aois to process")
 
-    n_workers = min(len(aoi_id_to_path), psutil.cpu_count(logical=False))
+    n_workers = calculate_taskgraph_worker_count(config, len(aoi_id_to_path))
     update_rate = 15.0
+    logger.info("using %d TaskGraph workers", n_workers)
 
     task_graph = taskgraph.TaskGraph(config["work_dir"], n_workers, update_rate)
     logging.getLogger("ecoshard").setLevel(config["logging"]["level"])
