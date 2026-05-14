@@ -722,6 +722,16 @@ def _chunks(iterable, size):
     return iter(lambda: list(islice(it, size)), [])
 
 
+def _sum_raster_blocks(raster_path):
+    total = np.float64(0)
+    for _, block in geoprocessing.iterblocks(
+        (str(raster_path), 1),
+        largest_block=10 * 2**20,
+    ):
+        total += np.sum(block, dtype=np.float64)
+    return total
+
+
 def subset_subwatersheds(
     aoi_vector_path: str | Path,
     subwatershed_vector_path: str | Path,
@@ -1234,7 +1244,6 @@ def apply_travel_time_mask(
 
     with rasterio.open(target_pop_clipped_raster_path) as pop_ref:
         ref_meta = pop_ref.meta.copy()
-        pop_array = pop_ref.read(1)
 
     _clip_and_reproject_raster(
         traveltime_raster_path,
@@ -1275,16 +1284,23 @@ def apply_travel_time_mask(
     with rasterio.open(target_max_reach_raster_path, "w", **aoi_meta) as max_reach:
         max_reach.write(travel_reach_array, 1)
 
-    pop_meta = ref_meta.copy()
-    pop_meta.update(
-        {"count": 1, "dtype": rasterio.int32, "nodata": 0, "compress": "lzw"}
+    travel_reach_array = None
+
+    def mask_op(mask, pop_val):
+        return np.where((mask > 0) & (pop_val > 0), pop_val, 0)
+
+    geoprocessing.raster_calculator(
+        [
+            (str(target_max_reach_raster_path), 1),
+            (str(target_pop_clipped_raster_path), 1),
+        ],
+        mask_op,
+        target_pop_raster_path,
+        gdal.GDT_Int32,
+        0,
+        largest_block=10 * 2**20,
     )
-    pop_masked_array = np.where(
-        (travel_reach_array > 0) & (pop_array > 0), pop_array, 0
-    )
-    with rasterio.open(target_pop_raster_path, "w", **pop_meta) as dst:
-        dst.write(pop_masked_array, 1)
-    return np.sum(pop_masked_array)
+    return _sum_raster_blocks(target_pop_raster_path)
 
 
 def create_distance_transform(base_mask_raster_path, target_distance_transform_path):
@@ -1553,15 +1569,6 @@ def combine_pops(
             result = np.maximum(result, value_array)
         return result
 
-    def raster_sum(raster_path):
-        total = np.float64(0)
-        for _, block in geoprocessing.iterblocks(
-            (str(raster_path), 1),
-            largest_block=10 * 2**20,
-        ):
-            total += np.sum(block, dtype=np.float64)
-        return total
-
     raster_ids = [raster_id for raster_id, _ in pop_id_raster_list]
     base_pop_raster_list = [str(path) for _, path in pop_id_raster_list]
 
@@ -1586,7 +1593,7 @@ def combine_pops(
     )
 
     aligned_pop_sums_by_id = {
-        raster_id: raster_sum(aligned_path)
+        raster_id: _sum_raster_blocks(aligned_path)
         for raster_id, aligned_path in zip(raster_ids, aligned_pop_raster_list)
     }
 
@@ -1599,7 +1606,9 @@ def combine_pops(
         largest_block=10 * 2**20,
     )
 
-    aligned_pop_sums_by_id["combined pop"] = raster_sum(target_combined_pop_raster_path)
+    aligned_pop_sums_by_id["combined pop"] = _sum_raster_blocks(
+        target_combined_pop_raster_path
+    )
 
     return aligned_pop_sums_by_id
 

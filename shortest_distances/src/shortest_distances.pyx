@@ -24,7 +24,7 @@ import numpy
 
 cimport cython
 cimport numpy
-from libc.math cimport sqrtf
+from libc.math cimport sqrt
 from libc.time cimport time as ctime
 from libc.time cimport time_t
 from libcpp.deque cimport deque
@@ -96,14 +96,14 @@ def find_mask_reach(
     cdef int i, j
     cdef numpy.ndarray[numpy.uint8_t, ndim=2] mask_coverage = numpy.zeros(
         (n_rows, n_cols), dtype=numpy.uint8)
-    cdef numpy.ndarray[float, ndim=2] current_time = numpy.where(
-        mask_array == 1, 0, numpy.inf).astype(numpy.float32)
+    cdef numpy.ndarray[float, ndim=2] current_time
 
-    cdef float diag_cell_length_m = sqrtf(<float>(2*cell_length_m*cell_length_m))
+    cdef float diag_cell_length_m = <float>sqrt(
+        <double>(2*cell_length_m*cell_length_m))
     cdef float frict_n, c_time, n_time, edge_weight
     cdef int i_start, j_start, i_n, j_n
-    cdef int min_i, min_j, max_i, max_j
-    cdef int mask_val
+    cdef int v
+    cdef bint is_frontier
 
     cdef DistPriorityQueueType dist_queue
     cdef ValuePixelType pixel
@@ -114,66 +114,77 @@ def find_mask_reach(
                     continue
                 mask_coverage[j_start, i_start] = 1
 
+                is_frontier = False
+                for v in range(8):
+                    i_n = i_start+ioff[v]
+                    j_n = j_start+joff[v]
+                    if i_n < 0 or i_n >= n_cols:
+                        continue
+                    if j_n < 0 or j_n >= n_rows:
+                        continue
+                    if mask_array[j_n, i_n] != 0:
+                        continue
+                    if friction_array[j_n, i_n] <= 0:
+                        continue
+                    is_frontier = True
+                    break
+
+                if not is_frontier:
+                    continue
+
                 pixel.t_time = 0
                 pixel.edge_weight = 0
                 pixel.i = i_start
                 pixel.j = j_start
                 dist_queue.push(pixel)
-                min_i = i_start
-                max_i = i_start
-                min_j = j_start
-                max_j = j_start
 
-                # c_ -- current, n_ -- neighbor
-                while dist_queue.size() > 0:
-                    pixel = dist_queue.top()
-                    dist_queue.pop()
-                    c_time = pixel.t_time
-                    i = pixel.i
-                    j = pixel.j
-                    if c_time > current_time[j, i]:
-                        # this means another path already reached here that's
-                        # better
-                        continue
-                    mask_coverage[j, i] = 1
-                    if i < min_i:
-                        min_i = i
-                    elif i > max_i:
-                        max_i = i
-                    if j < min_j:
-                        min_j = j
-                    elif j > max_j:
-                        max_j = j
+    if dist_queue.empty():
+        return mask_coverage
 
-                    for v in range(8):
-                        i_n = i+ioff[v]
-                        j_n = j+joff[v]
-                        if i_n < 0 or i_n >= n_cols:
-                            continue
-                        if j_n < 0 or j_n >= n_rows:
-                            continue
-                        if mask_array[j_n, i_n] < 0:
-                            # nodata, so skip
-                            continue
-                        frict_n = friction_array[j_n, i_n]
-                        # the nodata value is undefined but will present as 0.
-                        if frict_n <= 0:
-                            continue
-                        if v & 1:  # if msd is 1, it's odd
-                            edge_weight = frict_n*diag_cell_length_m
-                        else:
-                            edge_weight = frict_n*cell_length_m
+    current_time = numpy.full((n_rows, n_cols), max_time+1, dtype=numpy.float32)
 
-                        n_time = c_time + edge_weight
-                        if n_time > max_time:
-                            continue
-                        # if visited before and we got there faster, then skip
-                        if n_time >= current_time[j_n, i_n]:
-                            continue
-                        current_time[j_n, i_n] = n_time
-                        pixel.t_time = n_time
-                        pixel.edge_weight = edge_weight
-                        pixel.i = i_n
-                        pixel.j = j_n
-                        dist_queue.push(pixel)
+    with nogil:
+        # c_ -- current, n_ -- neighbor
+        while dist_queue.size() > 0:
+            pixel = dist_queue.top()
+            dist_queue.pop()
+            c_time = pixel.t_time
+            i = pixel.i
+            j = pixel.j
+            if mask_array[j, i] != 1 and c_time > current_time[j, i]:
+                # this means another path already reached here that's better
+                continue
+            mask_coverage[j, i] = 1
+
+            for v in range(8):
+                i_n = i+ioff[v]
+                j_n = j+joff[v]
+                if i_n < 0 or i_n >= n_cols:
+                    continue
+                if j_n < 0 or j_n >= n_rows:
+                    continue
+                if mask_array[j_n, i_n] != 0:
+                    # nodata or source cells are already covered
+                    continue
+                frict_n = friction_array[j_n, i_n]
+                # the nodata value is undefined but will present as 0.
+                if frict_n <= 0:
+                    continue
+                if v & 1:  # if msd is 1, it's odd
+                    edge_weight = frict_n*diag_cell_length_m
+                else:
+                    edge_weight = frict_n*cell_length_m
+
+                n_time = c_time + edge_weight
+                if n_time > max_time:
+                    continue
+                # if visited before and we got there faster, then skip
+                if n_time >= current_time[j_n, i_n]:
+                    continue
+                current_time[j_n, i_n] = n_time
+                pixel.t_time = n_time
+                pixel.edge_weight = edge_weight
+                pixel.i = i_n
+                pixel.j = j_n
+                dist_queue.push(pixel)
     return mask_coverage
