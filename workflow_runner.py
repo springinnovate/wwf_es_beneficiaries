@@ -57,6 +57,20 @@ logging.getLogger("rasterio").setLevel(logging.WARNING)
 FULL_RASTER_EXTENT_AOI_ID = "full_raster_extent"
 
 
+class TqdmLoggingHandler(logging.StreamHandler):
+    """Write console logs without corrupting active tqdm progress bars."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            tqdm.write(msg, file=self.stream)
+            self.flush()
+        except RecursionError:
+            raise
+        except Exception:
+            self.handleError(record)
+
+
 @dataclass
 class PickedCRS:
     """Used to define a return type for CRS."""
@@ -464,7 +478,7 @@ def setup_logger(level: str, log_file: str) -> logging.Logger:
 
     fmt = "%(asctime)s %(filename)s:%(lineno)d [%(levelname)s]  %(message)s"
 
-    sh = logging.StreamHandler(sys.stdout)
+    sh = TqdmLoggingHandler(sys.stdout)
     sh.setFormatter(logging.Formatter(fmt))
     root_logger.addHandler(sh)
 
@@ -472,6 +486,8 @@ def setup_logger(level: str, log_file: str) -> logging.Logger:
         fh = logging.FileHandler(log_file, mode="w", encoding="utf-8")
         fh.setFormatter(logging.Formatter(fmt))
         root_logger.addHandler(fh)
+
+    logging.getLogger("pyogrio").setLevel(logging.WARNING)
 
     return root_logger
 
