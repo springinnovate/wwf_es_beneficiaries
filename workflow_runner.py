@@ -289,8 +289,7 @@ def process_config(config_path: Path) -> Dict[str, Any]:
     subwatershed_vector_path = inputs.get("subwatershed_vector_path", "")
     dem_raster_path = inputs.get("dem_raster_path", "")
     aoi_vector_pattern = [
-        pattern for pattern in _as_list(inputs.get("aoi_vector_pattern", []))
-        if pattern
+        pattern for pattern in _as_list(inputs.get("aoi_vector_pattern", [])) if pattern
     ]
     analyze_full_raster_extent = inputs.get("analyze_full_raster_extent", False)
     if not isinstance(analyze_full_raster_extent, bool):
@@ -643,8 +642,7 @@ def create_full_raster_extent_aoi(config: dict, target_aoi_vector_path: Path) ->
         with rasterio.open(raster_path) as raster:
             if raster.crs is None:
                 raise ValueError(
-                    "Raster has no CRS and cannot define an extent: "
-                    f"{raster_path}"
+                    "Raster has no CRS and cannot define an extent: " f"{raster_path}"
                 )
             minx, miny, maxx, maxy = transform_bounds(
                 raster.crs,
@@ -660,8 +658,7 @@ def create_full_raster_extent_aoi(config: dict, target_aoi_vector_path: Path) ->
 
         if intersection_geom.is_empty:
             raise ValueError(
-                "No shared raster extent remains after intersecting "
-                f"{raster_path}."
+                "No shared raster extent remains after intersecting " f"{raster_path}."
             )
 
     target_aoi_vector_path.parent.mkdir(parents=True, exist_ok=True)
@@ -723,6 +720,16 @@ def collect_aoi_files(config: dict) -> dict[str, Path]:
 def _chunks(iterable, size):
     it = iter(iterable)
     return iter(lambda: list(islice(it, size)), [])
+
+
+def _sum_raster_blocks(raster_path):
+    total = np.float64(0)
+    for _, block in geoprocessing.iterblocks(
+        (str(raster_path), 1),
+        largest_block=10 * 2**20,
+    ):
+        total += np.sum(block, dtype=np.float64)
+    return total
 
 
 def subset_subwatersheds(
@@ -1237,7 +1244,6 @@ def apply_travel_time_mask(
 
     with rasterio.open(target_pop_clipped_raster_path) as pop_ref:
         ref_meta = pop_ref.meta.copy()
-        pop_array = pop_ref.read(1)
 
     _clip_and_reproject_raster(
         traveltime_raster_path,
@@ -1278,16 +1284,23 @@ def apply_travel_time_mask(
     with rasterio.open(target_max_reach_raster_path, "w", **aoi_meta) as max_reach:
         max_reach.write(travel_reach_array, 1)
 
-    pop_meta = ref_meta.copy()
-    pop_meta.update(
-        {"count": 1, "dtype": rasterio.int32, "nodata": 0, "compress": "lzw"}
+    travel_reach_array = None
+
+    def mask_op(mask, pop_val):
+        return np.where((mask > 0) & (pop_val > 0), pop_val, 0)
+
+    geoprocessing.raster_calculator(
+        [
+            (str(target_max_reach_raster_path), 1),
+            (str(target_pop_clipped_raster_path), 1),
+        ],
+        mask_op,
+        target_pop_raster_path,
+        gdal.GDT_Int32,
+        0,
+        largest_block=10 * 2**20,
     )
-    pop_masked_array = np.where(
-        (travel_reach_array > 0) & (pop_array > 0), pop_array, 0
-    )
-    with rasterio.open(target_pop_raster_path, "w", **pop_meta) as dst:
-        dst.write(pop_masked_array, 1)
-    return np.sum(pop_masked_array)
+    return _sum_raster_blocks(target_pop_raster_path)
 
 
 def create_distance_transform(base_mask_raster_path, target_distance_transform_path):
@@ -1579,13 +1592,10 @@ def combine_pops(
         target_projection_wkt=wgs84_wkt,
     )
 
-    aligned_pop_sums_by_id = {}
-    for raster_id, aligned_path in zip(raster_ids, aligned_pop_raster_list):
-        raster = gdal.OpenEx(aligned_path)
-        array = raster.ReadAsArray()
-        raster = None
-        aligned_pop_sums_by_id[raster_id] = np.sum(array)
-        array = None
+    aligned_pop_sums_by_id = {
+        raster_id: _sum_raster_blocks(aligned_path)
+        for raster_id, aligned_path in zip(raster_ids, aligned_pop_raster_list)
+    }
 
     geoprocessing.raster_calculator(
         [(str(path), 1) for path in aligned_pop_raster_list],
@@ -1593,13 +1603,12 @@ def combine_pops(
         target_combined_pop_raster_path,
         gdal.GDT_Float32,
         None,
+        largest_block=10 * 2**20,
     )
 
-    raster = gdal.OpenEx(target_combined_pop_raster_path)
-    array = raster.ReadAsArray()
-    raster = None
-    aligned_pop_sums_by_id["combined pop"] = np.sum(array)
-    array = None
+    aligned_pop_sums_by_id["combined pop"] = _sum_raster_blocks(
+        target_combined_pop_raster_path
+    )
 
     return aligned_pop_sums_by_id
 
