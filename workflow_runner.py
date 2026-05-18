@@ -52,7 +52,9 @@ from tqdm.auto import tqdm
 import shortest_distances
 
 logging.getLogger("rasterio").setLevel(logging.WARNING)
-
+logging.getLogger("ecoshard").setLevel(logging.WARNING)
+logging.getLogger("pyogrio").setLevel(logging.WARNING)
+logging.getLogger("geopandas").setLevel(logging.WARNING)
 
 FULL_RASTER_EXTENT_AOI_ID = "full_raster_extent"
 
