@@ -1738,7 +1738,7 @@ def main() -> None:
     if not has_conditional_mask:
         work_unit_count = len(aoi_work_items)
     n_workers = calculate_taskgraph_worker_count(config, work_unit_count)
-    update_rate = 15.0
+    update_rate = None  # Supress taskgraph output
     logger.info("using %d TaskGraph workers", n_workers)
 
     task_graph = taskgraph.TaskGraph(config["work_dir"], n_workers, update_rate)
