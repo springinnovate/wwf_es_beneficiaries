@@ -51,10 +51,15 @@ from tqdm.auto import tqdm
 
 import shortest_distances
 
-logging.getLogger("rasterio").setLevel(logging.WARNING)
-logging.getLogger("ecoshard").setLevel(logging.WARNING)
-logging.getLogger("pyogrio").setLevel(logging.WARNING)
-logging.getLogger("geopandas").setLevel(logging.WARNING)
+for logger_name in [
+    "ecoshard",
+    "ecoshard.taskgraph",
+    "pyogrio",
+    "pyogrio._io",
+    "geopandas",
+    "rasterio",
+]:
+    logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 FULL_RASTER_EXTENT_AOI_ID = "full_raster_extent"
 
@@ -1722,9 +1727,6 @@ def main() -> None:
     logger.info("using %d TaskGraph workers", n_workers)
 
     task_graph = taskgraph.TaskGraph(config["work_dir"], n_workers, update_rate)
-    logging.getLogger("ecoshard").setLevel(config["logging"]["level"])
-    logging.basicConfig()
-
     section_mask_ids = set()
     combined_header = "combined pop"
     section_mask_ids.add(combined_header)
@@ -1765,7 +1767,6 @@ def main() -> None:
                     task_name=f"clip base data for {aoi_key} {partition_id}",
                 )
 
-                dem_path_root, dem_path_ext = os.path.splitext(str(clipped_dem_path))
                 target_flow_dir_raster_path = f"{dem_path_root}_mfdflow{dem_path_ext}"
                 flow_dir_task = task_graph.add_task(
                     func=calc_flow_dir,
