@@ -1212,6 +1212,11 @@ def _clip_and_reproject_raster(
             }
         )
 
+        reproject_kwargs = {}
+        if src.nodata is not None:
+            reproject_kwargs["src_nodata"] = src.nodata
+            reproject_kwargs["dst_nodata"] = src.nodata
+
         with rasterio.open(target_raster_path, "w", **out_meta) as dst:
             reproject(
                 source=out_image,
@@ -1221,6 +1226,7 @@ def _clip_and_reproject_raster(
                 dst_transform=dst_transform,
                 dst_crs=dst_crs,
                 resampling=Resampling.nearest,
+                **reproject_kwargs,
             )
 
 
