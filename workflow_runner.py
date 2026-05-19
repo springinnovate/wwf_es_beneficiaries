@@ -1781,7 +1781,7 @@ def main() -> None:
                     target_path_list=target_clipped_raster_path_list,
                     task_name=f"clip base data for {aoi_key} {partition_id}",
                 )
-
+                dem_path_root, dem_path_ext = os.path.splitext(str(clipped_dem_path))
                 target_flow_dir_raster_path = f"{dem_path_root}_mfdflow{dem_path_ext}"
                 flow_dir_task = task_graph.add_task(
                     func=calc_flow_dir,
