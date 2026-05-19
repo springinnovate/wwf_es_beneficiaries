@@ -1343,6 +1343,7 @@ def apply_travel_time_mask(
         gdal.GDT_Int32,
         0,
         largest_block=10 * 2**20,
+        calc_raster_stats=False,
     )
     return _sum_raster_blocks(target_pop_raster_path)
 
@@ -1513,6 +1514,7 @@ def calculate_ds_pop_from_conditional_raster(
         condition_raster_path,
         gdal.GDT_Byte,
         None,
+        calc_raster_stats=False,
     )
 
     ds_coverage_raster_path = str(
@@ -1569,6 +1571,7 @@ def calculate_ds_pop_from_conditional_raster(
             maxdist_buffered_ds_coverage_raster_path,
             gdal.GDT_Byte,
             None,
+            calc_raster_stats=False,
         )
         buffered_ds_coverage_raster_path = maxdist_buffered_ds_coverage_raster_path
 
@@ -1587,6 +1590,7 @@ def calculate_ds_pop_from_conditional_raster(
         target_pop_raster_path,
         pop_info["datatype"],
         None,
+        calc_raster_stats=False,
     )
     return np.sum(gdal.OpenEx(target_pop_raster_path).ReadAsArray())
 
@@ -1648,6 +1652,7 @@ def combine_pops(
         gdal.GDT_Float32,
         None,
         largest_block=10 * 2**20,
+        calc_raster_stats=False,
     )
 
     aligned_pop_sums_by_id["combined pop"] = _sum_raster_blocks(
