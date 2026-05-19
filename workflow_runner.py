@@ -51,14 +51,22 @@ from tqdm.auto import tqdm
 
 import shortest_distances
 
-for logger_name in [
+QUIET_LOGGER_NAMES = [
     "ecoshard",
     "ecoshard.taskgraph",
     "pyogrio",
     "pyogrio._io",
     "geopandas",
     "rasterio",
-]:
+]
+
+APP_LOGGER_NAMES = [
+    __name__,
+    "workflow_runner",
+    "shortest_distances",
+]
+
+for logger_name in QUIET_LOGGER_NAMES:
     logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 FULL_RASTER_EXTENT_AOI_ID = "full_raster_extent"
@@ -480,7 +488,7 @@ def setup_logger(level: str, log_file: str) -> logging.Logger:
         logging.Logger: Configured logger instance.
     """
     root_logger = logging.getLogger()
-    root_logger.setLevel(level.upper())
+    root_logger.setLevel(logging.WARNING)
     root_logger.handlers.clear()
 
     fmt = "%(asctime)s %(filename)s:%(lineno)d [%(levelname)s]  %(message)s"
@@ -494,7 +502,10 @@ def setup_logger(level: str, log_file: str) -> logging.Logger:
         fh.setFormatter(logging.Formatter(fmt))
         root_logger.addHandler(fh)
 
-    logging.getLogger("pyogrio").setLevel(logging.WARNING)
+    for logger_name in APP_LOGGER_NAMES:
+        logging.getLogger(logger_name).setLevel(level.upper())
+    for logger_name in QUIET_LOGGER_NAMES:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
     return root_logger
 
@@ -577,32 +588,31 @@ def validate_paths(config: Dict[str, Any]) -> None:
 def print_yaml_config(config):
     """Just for debugging..."""
     logger = logging.getLogger(__name__)
-    logger.info("doing something important")
-    logger.info("run_name: %s", config["run_name"])
-    logger.info("work_dir: %s", config["work_dir"])
-    logger.info("output_dir: %s", config["output_dir"])
-    logger.info("inputs:")
+    logger.debug("run_name: %s", config["run_name"])
+    logger.debug("work_dir: %s", config["work_dir"])
+    logger.debug("output_dir: %s", config["output_dir"])
+    logger.debug("inputs:")
     for k, v in config["inputs"].items():
         if isinstance(v, list):
-            logger.info("  %s:", k)
+            logger.debug("  %s:", k)
             for item in v:
-                logger.info("    - %s", item)
+                logger.debug("    - %s", item)
         else:
-            logger.info("  %s: %s", k, v)
-    logger.info("masks:")
+            logger.debug("  %s: %s", k, v)
+    logger.debug("masks:")
     for m in config["masks"]:
-        logger.info("  - id: %s", m["id"])
-        logger.info("    type: %s", m["type"])
+        logger.debug("  - id: %s", m["id"])
+        logger.debug("    type: %s", m["type"])
         if m.get("params"):
-            logger.info("    params:")
+            logger.debug("    params:")
             for pk, pv in m["params"].items():
-                logger.info("      %s: %s", pk, pv)
-    logger.info("combine:")
+                logger.debug("      %s: %s", pk, pv)
+    logger.debug("combine:")
     for c in config["combine"]:
-        logger.info("  - %s", c)
-    logger.info("logging:")
-    logger.info("  level: %s", config["logging"]["level"])
-    logger.info("  to_file: %s", config["logging"]["to_file"])
+        logger.debug("  - %s", c)
+    logger.debug("logging:")
+    logger.debug("  level: %s", config["logging"]["level"])
+    logger.debug("  to_file: %s", config["logging"]["to_file"])
 
 
 def _raster_paths_for_full_extent(config: dict) -> list[Path]:
@@ -791,7 +801,7 @@ def subset_subwatersheds(
             missing, or if the AOI and sub-watershed geometries do not overlap.
     """
     logger = logging.getLogger(__name__)
-    logger.info(f"processing aoi {aoi_vector_path}")
+    logger.debug(f"processing aoi {aoi_vector_path}")
 
     # Read AOI and precompute union + bbox; repair invalid with make_valid if available
     aoi_gdf = gpd.read_file(aoi_vector_path)
@@ -823,7 +833,7 @@ def subset_subwatersheds(
         zip(attrs["HYBAS_ID"].to_numpy(), attrs["NEXT_DOWN"].to_numpy())
     )
 
-    logger.info(f"spatial pre-filter {aoi_vector_path} w/ bb")
+    logger.debug(f"spatial pre-filter {aoi_vector_path} w/ bb")
     sub_bbox_gdf = pyogrio.read_dataframe(
         subwatershed_vector_path,
         bbox=aoi_bbox.bounds,
@@ -857,7 +867,7 @@ def subset_subwatersheds(
         raise ValueError(f"No valid geometry found for {aoi_vector_path}.")
 
     # Fetch geometries for all_ids using batched attribute filters
-    logger.info(f"fetch geometries by attribute filter {aoi_vector_path}")
+    logger.debug(f"fetch geometries by attribute filter {aoi_vector_path}")
     downstream_features = []
     for id_chunk in _chunks(sorted(visited_ids), 1000):
         where = f'HYBAS_ID IN ({",".join(map(str, id_chunk))})'
@@ -892,7 +902,7 @@ def subset_subwatersheds(
 
     sub_gdf = sub_gdf.to_crs(target_crs.crs)
     sub_gdf.to_file(target_subset_subwatersheds_vector_path, driver="GPKG")
-    logger.info(f"all done subwatershedding {aoi_vector_path}")
+    logger.debug(f"all done subwatershedding {aoi_vector_path}")
 
 
 def partition_subwatersheds_by_terminal_drain(
@@ -946,6 +956,7 @@ def partition_subwatersheds_by_terminal_drain(
         desc="read watershed topology",
         unit="table",
         dynamic_ncols=True,
+        leave=False,
     ) as progress:
         attrs = pyogrio.read_dataframe(
             subwatershed_vector_path,
@@ -965,6 +976,7 @@ def partition_subwatersheds_by_terminal_drain(
         desc="read AOI candidate watersheds",
         unit="table",
         dynamic_ncols=True,
+        leave=False,
     ) as progress:
         sub_bbox_gdf = pyogrio.read_dataframe(
             subwatershed_vector_path,
@@ -988,6 +1000,7 @@ def partition_subwatersheds_by_terminal_drain(
         desc="collect downstream watersheds",
         unit="watershed",
         dynamic_ncols=True,
+        leave=False,
     ) as progress:
         progress.update(len(visited_ids))
         while ds_ids_to_process:
@@ -1017,6 +1030,7 @@ def partition_subwatersheds_by_terminal_drain(
         desc="group watersheds by sink",
         unit="watershed",
         dynamic_ncols=True,
+        leave=False,
     ):
         next_sink_id = hybas_to_nextsink.get(hybas_id)
         if next_sink_id is None or pd.isna(next_sink_id):
@@ -1031,6 +1045,7 @@ def partition_subwatersheds_by_terminal_drain(
         total=total_chunks,
         unit="chunk",
         dynamic_ncols=True,
+        leave=False,
     ):
         where = f'HYBAS_ID IN ({",".join(map(str, id_chunk))})'
         df = pyogrio.read_dataframe(
@@ -1163,7 +1178,7 @@ def _clip_and_reproject_raster(
             )
         else:
             # Check intermediate clamped bounds explicitly:
-            logger.info(f"Clamped bbox bounds: {bbox_gdf.total_bounds}")
+            logger.debug(f"Clamped bbox bounds: {bbox_gdf.total_bounds}")
 
             # Safely project to src.crs (e.g., EPSG:4326)
             projected_box_gdf = bbox_gdf.to_crs(src.crs)
@@ -1247,7 +1262,7 @@ def apply_travel_time_mask(
         bbox[3] + buffer_distance_m,
     )
 
-    logger.info(f"buffered box: {buffered_bbox}")
+    logger.debug(f"buffered box: {buffered_bbox}")
     bbox_gdf = gpd.GeoDataFrame({"geometry": [buffered_bbox]}, crs=projected_gdf.crs)
 
     target_pop_clipped_raster_path = Path(
@@ -1438,7 +1453,7 @@ def calculate_ds_pop_from_conditional_raster(
         after applying the downstream coverage and optional distance limit.
     """
     logger = logging.getLogger(__name__)
-    logger.info(f"max downstream distance: {max_downstream_distance_m}")
+    logger.debug(f"max downstream distance: {max_downstream_distance_m}")
     condition_raster_path = working_dir / f"mask_{condition_id}_{base_raster_path.name}"
 
     clipped_base_raster_path = (

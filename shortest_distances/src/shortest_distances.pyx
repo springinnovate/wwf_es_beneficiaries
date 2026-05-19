@@ -15,7 +15,6 @@ cdef extern from *:
 
 import time
 import logging
-import sys
 import heapq
 
 from osgeo import gdal
@@ -60,12 +59,6 @@ cdef cppclass LessPixel nogil:
         return lhs.t_time > rhs.t_time
 
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format=(
-        '%(asctime)s (%(relativeCreated)d) %(levelname)s %(name)s'
-        ' [%(funcName)s:%(lineno)d] %(message)s'),
-    stream=sys.stdout)
 LOGGER = logging.getLogger(__name__)
 
 
