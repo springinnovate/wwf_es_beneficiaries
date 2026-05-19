@@ -51,6 +51,22 @@ from tqdm.auto import tqdm
 
 import shortest_distances
 
+RASTER_BLOCK_SIZE = 256
+
+
+def _set_tiled_geotiff_creation_options(raster_meta: dict) -> None:
+    """Set Rasterio creation options for block-aligned GeoTIFF writes."""
+    raster_meta.update(
+        {
+            "tiled": True,
+            "blockxsize": RASTER_BLOCK_SIZE,
+            "blockysize": RASTER_BLOCK_SIZE,
+            "compress": "lzw",
+            "BIGTIFF": "YES",
+        }
+    )
+
+
 QUIET_LOGGER_NAMES = [
     "ecoshard",
     "ecoshard.taskgraph",
@@ -1211,6 +1227,7 @@ def _clip_and_reproject_raster(
                 "height": height,
             }
         )
+        _set_tiled_geotiff_creation_options(out_meta)
 
         reproject_kwargs = {}
         if src.nodata is not None:
@@ -1309,6 +1326,7 @@ def apply_travel_time_mask(
     aoi_meta.update(
         {"count": 1, "dtype": rasterio.uint8, "nodata": 0, "compress": "lzw"}
     )
+    _set_tiled_geotiff_creation_options(aoi_meta)
 
     with rasterio.open(target_aoi_raster_path, "w", **aoi_meta) as dst:
         dst.write(mask_array, 1)
