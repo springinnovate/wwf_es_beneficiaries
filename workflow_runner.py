@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import collections
 import contextlib
+import math
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 import argparse
@@ -37,9 +38,12 @@ from rasterio.warp import (
     Resampling,
     transform_bounds,
 )
+from rasterio.transform import from_origin
+from rasterio.vrt import WarpedVRT
+from rasterio.windows import Window, from_bounds
 from ecoshard import geoprocessing
 from ecoshard.geoprocessing import routing
-from osgeo import gdal, osr
+from osgeo import gdal
 from shapely.geometry import box
 from shapely.ops import transform
 import geopandas as gpd
@@ -56,6 +60,15 @@ import shortest_distances
 
 RASTER_BLOCK_SIZE = 256
 HEARTBEAT_INTERVAL_SECONDS = 60
+GTIFF_CREATION_OPTIONS = (
+    "TILED=YES",
+    "BIGTIFF=YES",
+    "COMPRESS=LZW",
+    f"BLOCKXSIZE={RASTER_BLOCK_SIZE}",
+    f"BLOCKYSIZE={RASTER_BLOCK_SIZE}",
+    "NUM_THREADS=ALL_CPUS",
+)
+GTIFF_CREATION_TUPLE = ("GTIFF", GTIFF_CREATION_OPTIONS)
 
 
 def _set_tiled_geotiff_creation_options(raster_meta: dict) -> None:
@@ -172,14 +185,7 @@ def create_circular_kernel(kernel_path, buffer_size_in_px):
         diameter,
         1,
         gdal.GDT_Float32,
-        options=(
-            "TILED=YES",
-            "BIGTIFF=YES",
-            "COMPRESS=LZW",
-            "BLOCKXSIZE=256",
-            "BLOCKYSIZE=256",
-            "NUM_THREADS=ALL_CPUS",
-        ),
+        options=GTIFF_CREATION_OPTIONS,
     )
     out_raster.GetRasterBand(1).WriteArray(kernel_array)
     out_raster.FlushCache()
@@ -1170,6 +1176,7 @@ def align_and_resize_raster_stack_on_vector(
         resample_method_list,
         target_pixel_size,
         [float(x) for x in gdf.total_bounds],
+        raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
     )
 
 
@@ -1393,6 +1400,7 @@ def apply_travel_time_mask(
         0,
         largest_block=10 * 2**20,
         calc_raster_stats=False,
+        raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
     )
     return _sum_raster_blocks(target_pop_raster_path)
 
@@ -1427,14 +1435,7 @@ def create_distance_transform(base_mask_raster_path, target_distance_transform_p
         base_raster.RasterYSize,
         1,
         gdal.GDT_Float32,
-        [
-            "TILED=YES",
-            "BIGTIFF=YES",
-            "COMPRESS=LZW",
-            "BLOCKXSIZE=256",
-            "BLOCKYSIZE=256",
-            "NUM_THREADS=ALL_CPUS",
-        ],
+        GTIFF_CREATION_OPTIONS,
     )
 
     target_raster.SetGeoTransform(base_raster.GetGeoTransform())
@@ -1530,6 +1531,7 @@ def calculate_ds_pop_from_conditional_raster(
         vector_mask_options={
             "mask_vector_path": aoi_vector_path,
         },
+        raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
     )
 
     base_raster_nodata = base_info["nodata"][0]
@@ -1564,6 +1566,7 @@ def calculate_ds_pop_from_conditional_raster(
         gdal.GDT_Byte,
         None,
         calc_raster_stats=False,
+        raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
     )
 
     ds_coverage_raster_path = str(
@@ -1574,6 +1577,7 @@ def calculate_ds_pop_from_conditional_raster(
         (str(flow_dir_raster_path), 1),
         str(ds_coverage_raster_path),
         weight_raster_path_band=(str(condition_raster_path), 1),
+        raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
     )
 
     buffer_amounts_in_pixels = int(np.round(buffer_size_m / travel_time_pixel_size_m))
@@ -1590,6 +1594,7 @@ def calculate_ds_pop_from_conditional_raster(
         (kernel_path, 1),
         buffered_ds_coverage_raster_path,
         n_workers=1,
+        raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
     )
     if max_downstream_distance_m is not None:
 
@@ -1621,6 +1626,7 @@ def calculate_ds_pop_from_conditional_raster(
             gdal.GDT_Byte,
             None,
             calc_raster_stats=False,
+            raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
         )
         buffered_ds_coverage_raster_path = maxdist_buffered_ds_coverage_raster_path
 
@@ -1640,18 +1646,141 @@ def calculate_ds_pop_from_conditional_raster(
         pop_info["datatype"],
         None,
         calc_raster_stats=False,
+        raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
     )
     return np.sum(gdal.OpenEx(target_pop_raster_path).ReadAsArray())
 
 
 def calc_flow_dir(dem_path, working_dir, target_flow_dir_raster_path):
     pit_filled_raster_path = working_dir / f"pit_filled_{Path(dem_path).name}"
-    routing.fill_pits((dem_path, 1), pit_filled_raster_path, working_dir=working_dir)
+    routing.fill_pits(
+        (dem_path, 1),
+        pit_filled_raster_path,
+        working_dir=working_dir,
+        raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
+    )
     routing.flow_dir_mfd(
         (str(pit_filled_raster_path), 1),
         str(target_flow_dir_raster_path),
         working_dir=str(working_dir),
+        raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
     )
+
+
+def _raster_bounds_in_crs(raster: rasterio.DatasetReader, target_crs) -> tuple:
+    """Return raster bounds in ``target_crs``."""
+    if raster.crs is None:
+        raise ValueError(f"Raster has no CRS and cannot be combined: {raster.name}")
+    return transform_bounds(
+        raster.crs,
+        target_crs,
+        *raster.bounds,
+        densify_pts=21,
+    )
+
+
+def _combined_raster_profile(
+    raster_path_list: list[str],
+    wgs84_pixel_size: float,
+) -> dict:
+    """Build a 256x256 tiled WGS84 profile covering all rasters."""
+    pixel_size = abs(float(wgs84_pixel_size))
+    if pixel_size <= 0:
+        raise ValueError(f"wgs84_pixel_size must be positive, got {wgs84_pixel_size}")
+
+    target_crs = "EPSG:4326"
+    minx = miny = math.inf
+    maxx = maxy = -math.inf
+
+    for raster_path in raster_path_list:
+        with rasterio.open(raster_path) as raster:
+            left, bottom, right, top = _raster_bounds_in_crs(raster, target_crs)
+        minx = min(minx, left)
+        miny = min(miny, bottom)
+        maxx = max(maxx, right)
+        maxy = max(maxy, top)
+
+    if not all(math.isfinite(value) for value in [minx, miny, maxx, maxy]):
+        raise ValueError("No valid raster bounds were found for population combine.")
+
+    minx = math.floor(minx / pixel_size) * pixel_size
+    miny = math.floor(miny / pixel_size) * pixel_size
+    maxx = math.ceil(maxx / pixel_size) * pixel_size
+    maxy = math.ceil(maxy / pixel_size) * pixel_size
+
+    width = int(math.ceil((maxx - minx) / pixel_size))
+    height = int(math.ceil((maxy - miny) / pixel_size))
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            f"Invalid combined raster dimensions from bounds "
+            f"{[minx, miny, maxx, maxy]}: {width}x{height}"
+        )
+
+    profile = {
+        "driver": "GTiff",
+        "height": height,
+        "width": width,
+        "count": 1,
+        "dtype": "float32",
+        "crs": target_crs,
+        "transform": from_origin(minx, maxy, pixel_size, pixel_size),
+        "nodata": None,
+    }
+    _set_tiled_geotiff_creation_options(profile)
+    return profile
+
+
+def _integer_window(raw_window: Window, width: int, height: int) -> Window:
+    """Round a rasterio window outward and clamp it to raster dimensions."""
+    col_start = max(0, math.floor(raw_window.col_off))
+    row_start = max(0, math.floor(raw_window.row_off))
+    col_stop = min(width, math.ceil(raw_window.col_off + raw_window.width))
+    row_stop = min(height, math.ceil(raw_window.row_off + raw_window.height))
+    return Window(
+        col_start,
+        row_start,
+        max(0, col_stop - col_start),
+        max(0, row_stop - row_start),
+    )
+
+
+def _window_from_bounds(bounds: tuple, transform, width: int, height: int) -> Window:
+    """Return an integer target window covering ``bounds``."""
+    return _integer_window(from_bounds(*bounds, transform=transform), width, height)
+
+
+def _iter_block_windows(window: Window, block_size: int = RASTER_BLOCK_SIZE):
+    """Yield block-sized windows within ``window``."""
+    row_start = int(window.row_off)
+    col_start = int(window.col_off)
+    row_stop = int(window.row_off + window.height)
+    col_stop = int(window.col_off + window.width)
+    for row_off in range(row_start, row_stop, block_size):
+        block_height = min(block_size, row_stop - row_off)
+        for col_off in range(col_start, col_stop, block_size):
+            block_width = min(block_size, col_stop - col_off)
+            yield Window(col_off, row_off, block_width, block_height)
+
+
+def _create_zeroed_raster(target_path: Path, profile: dict) -> None:
+    """Create a zero-filled tiled raster so later window max writes are safe."""
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    dtype = np.dtype(profile["dtype"])
+    block_count = math.ceil(profile["width"] / RASTER_BLOCK_SIZE) * math.ceil(
+        profile["height"] / RASTER_BLOCK_SIZE
+    )
+    with rasterio.open(target_path, "w", **profile) as target:
+        for _, window in tqdm(
+            target.block_windows(1),
+            total=block_count,
+            desc="initialize combined raster",
+            unit="block",
+        ):
+            target.write(
+                np.zeros((int(window.height), int(window.width)), dtype=dtype),
+                1,
+                window=window,
+            )
 
 
 def combine_pops(
@@ -1662,13 +1791,10 @@ def combine_pops(
 ):
     logger = logging.getLogger(__name__)
 
-    def or_op(*value_list):
-        result = value_list[0]
-        for value_array in value_list[1:]:
-            result = np.maximum(result, value_array)
-        return result
-
     raster_count = len(pop_id_raster_list)
+    if raster_count == 0:
+        raise ValueError("No population rasters were provided for combine.")
+
     logger.info(
         "combining %d population rasters into %s",
         raster_count,
@@ -1677,93 +1803,106 @@ def combine_pops(
 
     raster_ids = [raster_id for raster_id, _ in pop_id_raster_list]
     base_pop_raster_list = [str(path) for _, path in pop_id_raster_list]
-
-    aligned_dir_path = working_dir / "aligned_pops"
-    aligned_dir_path.mkdir(parents=True, exist_ok=True)
-
-    aligned_pop_raster_list = [
-        str(aligned_dir_path / os.path.basename(path)) for path in base_pop_raster_list
-    ]
-
-    srs = osr.SpatialReference()
-    srs.ImportFromEPSG(4326)
-    wgs84_wkt = srs.ExportToWkt()
-
-    def _existing_aligned_count() -> int:
-        existing_count = 0
-        for aligned_path in aligned_pop_raster_list:
-            try:
-                if os.path.exists(aligned_path) and os.path.getsize(aligned_path) > 0:
-                    existing_count += 1
-            except OSError:
-                pass
-        return existing_count
+    target_combined_pop_raster_path = Path(target_combined_pop_raster_path)
+    target_profile = _combined_raster_profile(base_pop_raster_list, wgs84_pixel_size)
 
     logger.info(
-        "aligning %d population rasters into %s",
-        raster_count,
-        aligned_dir_path,
+        "initializing combined population raster %s: %dx%d px, "
+        "%dx%d blocks, block size=%dx%d",
+        target_combined_pop_raster_path,
+        target_profile["width"],
+        target_profile["height"],
+        math.ceil(target_profile["width"] / RASTER_BLOCK_SIZE),
+        math.ceil(target_profile["height"] / RASTER_BLOCK_SIZE),
+        RASTER_BLOCK_SIZE,
+        RASTER_BLOCK_SIZE,
     )
     with _log_heartbeat(
         logger,
-        lambda: (
-            "aligning population rasters: "
-            f"{_existing_aligned_count()}/{raster_count} outputs created"
-        ),
+        lambda: f"initializing combined population raster {target_combined_pop_raster_path}",
     ):
-        geoprocessing.align_and_resize_raster_stack(
-            base_pop_raster_list,
-            aligned_pop_raster_list,
-            ["near"] * len(aligned_pop_raster_list),
-            [wgs84_pixel_size, -wgs84_pixel_size],
-            "union",
-            target_projection_wkt=wgs84_wkt,
-        )
-    logger.info("aligned %d population rasters", raster_count)
+        _create_zeroed_raster(target_combined_pop_raster_path, target_profile)
 
-    logger.info("summing %d aligned population rasters", raster_count)
-    aligned_pop_sums_by_id = {}
-    sum_start_time = time.monotonic()
-    last_sum_log_time = sum_start_time
-    for raster_index, (raster_id, aligned_path) in enumerate(
-        zip(raster_ids, aligned_pop_raster_list),
-        start=1,
-    ):
-        aligned_pop_sums_by_id[raster_id] = _sum_raster_blocks(aligned_path)
-        now = time.monotonic()
-        if (
-            raster_index == raster_count
-            or now - last_sum_log_time >= HEARTBEAT_INTERVAL_SECONDS
-        ):
-            logger.info(
-                "summed aligned population rasters: %d/%d complete; elapsed=%ds",
-                raster_index,
-                raster_count,
-                int(now - sum_start_time),
-            )
-            last_sum_log_time = now
+    combine_state = {
+        "index": 0,
+        "raster_id": "",
+        "pixels": 0,
+    }
+    pop_sums_by_id = {}
 
     logger.info(
-        "writing combined population raster from %d aligned rasters to %s",
+        "streaming %d population rasters into %s",
         raster_count,
         target_combined_pop_raster_path,
     )
     with _log_heartbeat(
         logger,
         lambda: (
-            "writing combined population raster to "
-            f"{target_combined_pop_raster_path}"
+            "streaming population rasters: "
+            f"{combine_state['index']}/{raster_count} rasters, "
+            f"current={combine_state['raster_id']}, "
+            f"{combine_state['pixels']} target pixels visited"
         ),
     ):
-        geoprocessing.raster_calculator(
-            [(str(path), 1) for path in aligned_pop_raster_list],
-            or_op,
-            target_combined_pop_raster_path,
-            gdal.GDT_Float32,
-            None,
-            largest_block=10 * 2**20,
-            calc_raster_stats=False,
-        )
+        with rasterio.open(target_combined_pop_raster_path, "r+") as target:
+            target_crs = target.crs
+            target_transform = target.transform
+            with tqdm(
+                zip(raster_ids, base_pop_raster_list),
+                total=raster_count,
+                desc="combine population rasters",
+                unit="raster",
+            ) as progress:
+                for raster_index, (raster_id, source_path) in enumerate(
+                    progress,
+                    start=1,
+                ):
+                    combine_state["index"] = raster_index - 1
+                    combine_state["raster_id"] = str(raster_id)
+                    source_sum = np.float64(0)
+                    with rasterio.open(source_path) as source:
+                        source_bounds = _raster_bounds_in_crs(source, target_crs)
+                        target_window = _window_from_bounds(
+                            source_bounds,
+                            target_transform,
+                            target.width,
+                            target.height,
+                        )
+                        if target_window.width == 0 or target_window.height == 0:
+                            pop_sums_by_id[raster_id] = source_sum
+                            continue
+
+                        vrt_kwargs = {
+                            "crs": target_crs,
+                            "transform": target_transform,
+                            "width": target.width,
+                            "height": target.height,
+                            "resampling": Resampling.nearest,
+                            "dst_nodata": 0,
+                        }
+                        if source.nodata is not None:
+                            vrt_kwargs["src_nodata"] = source.nodata
+
+                        with WarpedVRT(source, **vrt_kwargs) as source_vrt:
+                            for window in _iter_block_windows(target_window):
+                                incoming = source_vrt.read(
+                                    1,
+                                    window=window,
+                                ).astype(np.float32, copy=False)
+                                combine_state["pixels"] += int(
+                                    window.width * window.height
+                                )
+                                source_sum += np.sum(incoming, dtype=np.float64)
+                                if not np.any(incoming):
+                                    continue
+                                existing = target.read(1, window=window)
+                                np.maximum(existing, incoming, out=existing)
+                                target.write(existing, 1, window=window)
+
+                    pop_sums_by_id[raster_id] = source_sum
+                    combine_state["index"] = raster_index
+                    progress.set_postfix_str(str(raster_id))
+
     logger.info("wrote combined population raster %s", target_combined_pop_raster_path)
 
     logger.info("summing combined population raster %s", target_combined_pop_raster_path)
@@ -1771,16 +1910,16 @@ def combine_pops(
         logger,
         lambda: f"summing combined population raster {target_combined_pop_raster_path}",
     ):
-        aligned_pop_sums_by_id["combined pop"] = _sum_raster_blocks(
+        pop_sums_by_id["combined pop"] = _sum_raster_blocks(
             target_combined_pop_raster_path
         )
     logger.info(
         "combined population raster sum complete for %s: %.6g",
         target_combined_pop_raster_path,
-        aligned_pop_sums_by_id["combined pop"],
+        pop_sums_by_id["combined pop"],
     )
 
-    return aligned_pop_sums_by_id
+    return pop_sums_by_id
 
 
 def calculate_taskgraph_worker_count(config: dict, work_unit_count: int) -> int:
