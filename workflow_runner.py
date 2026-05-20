@@ -15,13 +15,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import collections
+import contextlib
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 import argparse
 import os
 import glob
 import logging
 import sys
+import threading
+import time
 from itertools import islice
 
 from ecoshard import taskgraph
@@ -52,6 +55,7 @@ from tqdm.auto import tqdm
 import shortest_distances
 
 RASTER_BLOCK_SIZE = 256
+HEARTBEAT_INTERVAL_SECONDS = 60
 
 
 def _set_tiled_geotiff_creation_options(raster_meta: dict) -> None:
@@ -65,6 +69,33 @@ def _set_tiled_geotiff_creation_options(raster_meta: dict) -> None:
             "BIGTIFF": "YES",
         }
     )
+
+
+@contextlib.contextmanager
+def _log_heartbeat(
+    logger: logging.Logger,
+    message_factory: Callable[[], str],
+    interval_seconds: int = HEARTBEAT_INTERVAL_SECONDS,
+):
+    """Emit low-frequency heartbeat logs while a blocking operation runs."""
+    start_time = time.monotonic()
+    stop_event = threading.Event()
+
+    def _heartbeat() -> None:
+        while not stop_event.wait(interval_seconds):
+            logger.info(
+                "%s; elapsed=%ds",
+                message_factory(),
+                int(time.monotonic() - start_time),
+            )
+
+    thread = threading.Thread(target=_heartbeat, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        thread.join(timeout=1)
 
 
 QUIET_LOGGER_NAMES = [
@@ -1629,11 +1660,20 @@ def combine_pops(
     working_dir,
     target_combined_pop_raster_path,
 ):
+    logger = logging.getLogger(__name__)
+
     def or_op(*value_list):
         result = value_list[0]
         for value_array in value_list[1:]:
             result = np.maximum(result, value_array)
         return result
+
+    raster_count = len(pop_id_raster_list)
+    logger.info(
+        "combining %d population rasters into %s",
+        raster_count,
+        target_combined_pop_raster_path,
+    )
 
     raster_ids = [raster_id for raster_id, _ in pop_id_raster_list]
     base_pop_raster_list = [str(path) for _, path in pop_id_raster_list]
@@ -1649,32 +1689,95 @@ def combine_pops(
     srs.ImportFromEPSG(4326)
     wgs84_wkt = srs.ExportToWkt()
 
-    geoprocessing.align_and_resize_raster_stack(
-        base_pop_raster_list,
-        aligned_pop_raster_list,
-        ["near"] * len(aligned_pop_raster_list),
-        [wgs84_pixel_size, -wgs84_pixel_size],
-        "union",
-        target_projection_wkt=wgs84_wkt,
+    def _existing_aligned_count() -> int:
+        existing_count = 0
+        for aligned_path in aligned_pop_raster_list:
+            try:
+                if os.path.exists(aligned_path) and os.path.getsize(aligned_path) > 0:
+                    existing_count += 1
+            except OSError:
+                pass
+        return existing_count
+
+    logger.info(
+        "aligning %d population rasters into %s",
+        raster_count,
+        aligned_dir_path,
     )
+    with _log_heartbeat(
+        logger,
+        lambda: (
+            "aligning population rasters: "
+            f"{_existing_aligned_count()}/{raster_count} outputs created"
+        ),
+    ):
+        geoprocessing.align_and_resize_raster_stack(
+            base_pop_raster_list,
+            aligned_pop_raster_list,
+            ["near"] * len(aligned_pop_raster_list),
+            [wgs84_pixel_size, -wgs84_pixel_size],
+            "union",
+            target_projection_wkt=wgs84_wkt,
+        )
+    logger.info("aligned %d population rasters", raster_count)
 
-    aligned_pop_sums_by_id = {
-        raster_id: _sum_raster_blocks(aligned_path)
-        for raster_id, aligned_path in zip(raster_ids, aligned_pop_raster_list)
-    }
+    logger.info("summing %d aligned population rasters", raster_count)
+    aligned_pop_sums_by_id = {}
+    sum_start_time = time.monotonic()
+    last_sum_log_time = sum_start_time
+    for raster_index, (raster_id, aligned_path) in enumerate(
+        zip(raster_ids, aligned_pop_raster_list),
+        start=1,
+    ):
+        aligned_pop_sums_by_id[raster_id] = _sum_raster_blocks(aligned_path)
+        now = time.monotonic()
+        if (
+            raster_index == raster_count
+            or now - last_sum_log_time >= HEARTBEAT_INTERVAL_SECONDS
+        ):
+            logger.info(
+                "summed aligned population rasters: %d/%d complete; elapsed=%ds",
+                raster_index,
+                raster_count,
+                int(now - sum_start_time),
+            )
+            last_sum_log_time = now
 
-    geoprocessing.raster_calculator(
-        [(str(path), 1) for path in aligned_pop_raster_list],
-        or_op,
+    logger.info(
+        "writing combined population raster from %d aligned rasters to %s",
+        raster_count,
         target_combined_pop_raster_path,
-        gdal.GDT_Float32,
-        None,
-        largest_block=10 * 2**20,
-        calc_raster_stats=False,
     )
+    with _log_heartbeat(
+        logger,
+        lambda: (
+            "writing combined population raster to "
+            f"{target_combined_pop_raster_path}"
+        ),
+    ):
+        geoprocessing.raster_calculator(
+            [(str(path), 1) for path in aligned_pop_raster_list],
+            or_op,
+            target_combined_pop_raster_path,
+            gdal.GDT_Float32,
+            None,
+            largest_block=10 * 2**20,
+            calc_raster_stats=False,
+        )
+    logger.info("wrote combined population raster %s", target_combined_pop_raster_path)
 
-    aligned_pop_sums_by_id["combined pop"] = _sum_raster_blocks(
-        target_combined_pop_raster_path
+    logger.info("summing combined population raster %s", target_combined_pop_raster_path)
+    with _log_heartbeat(
+        logger,
+        lambda: f"summing combined population raster {target_combined_pop_raster_path}",
+    ):
+        aligned_pop_sums_by_id["combined pop"] = _sum_raster_blocks(
+            target_combined_pop_raster_path
+        )
+    logger.info(
+        "combined population raster sum complete for %s: %.6g",
+        target_combined_pop_raster_path,
+        aligned_pop_sums_by_id["combined pop"],
     )
 
     return aligned_pop_sums_by_id
