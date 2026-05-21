@@ -1782,7 +1782,16 @@ def _integer_window(raw_window: Window, width: int, height: int) -> Window:
 
 
 def _iter_block_windows(window: Window, block_size: int = RASTER_BLOCK_SIZE):
-    """Yield block-sized windows within ``window``."""
+    """Yield block-sized windows within a larger window.
+
+    Args:
+        window: Parent window to split into smaller read/write chunks.
+        block_size: Maximum width and height of each yielded window in pixels.
+
+    Yields:
+        Window objects covering ``window`` without exceeding ``block_size`` in
+        either dimension.
+    """
     row_start = int(window.row_off)
     col_start = int(window.col_off)
     row_stop = int(window.row_off + window.height)
