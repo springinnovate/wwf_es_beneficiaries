@@ -1695,7 +1695,22 @@ def _combined_raster_profile(
     raster_path_list: list[str],
     wgs84_pixel_size: float,
 ) -> dict:
-    """Build a 256x256 tiled WGS84 profile covering all rasters."""
+    """Build a tiled WGS84 Rasterio profile covering all input rasters.
+
+    Args:
+        raster_path_list: Paths to rasters whose combined bounds define the
+            output extent.
+        wgs84_pixel_size: Output pixel size in WGS84 degrees. The absolute
+            value is used so callers may pass a signed pixel size.
+
+    Returns:
+        Rasterio profile for a single-band, float32, 256 x 256 tiled GeoTIFF
+        in EPSG:4326.
+
+    Raises:
+        ValueError: If ``wgs84_pixel_size`` is not positive, no finite raster
+            bounds are found, or the calculated output dimensions are invalid.
+    """
     pixel_size = abs(float(wgs84_pixel_size))
     if pixel_size <= 0:
         raise ValueError(f"wgs84_pixel_size must be positive, got {wgs84_pixel_size}")
