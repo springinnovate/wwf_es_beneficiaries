@@ -1781,11 +1781,6 @@ def _integer_window(raw_window: Window, width: int, height: int) -> Window:
     )
 
 
-def _window_from_bounds(bounds: tuple, transform, width: int, height: int) -> Window:
-    """Return an integer target window covering ``bounds``."""
-    return _integer_window(from_bounds(*bounds, transform=transform), width, height)
-
-
 def _iter_block_windows(window: Window, block_size: int = RASTER_BLOCK_SIZE):
     """Yield block-sized windows within ``window``."""
     row_start = int(window.row_off)
@@ -1899,9 +1894,8 @@ def combine_pops(
                     source_sum = np.float64(0)
                     with rasterio.open(source_path) as source:
                         source_bounds = _raster_bounds_in_crs(source, target_crs)
-                        target_window = _window_from_bounds(
-                            source_bounds,
-                            target_transform,
+                        target_window = _integer_window(
+                            from_bounds(*source_bounds, transform=target_transform),
                             target.width,
                             target.height,
                         )
