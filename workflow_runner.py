@@ -1668,7 +1668,19 @@ def calc_flow_dir(dem_path, working_dir, target_flow_dir_raster_path):
 
 
 def _raster_bounds_in_crs(raster: rasterio.DatasetReader, target_crs) -> tuple:
-    """Return raster bounds in ``target_crs``."""
+    """Return raster bounds transformed into a target CRS.
+
+    Args:
+        raster: Open Rasterio dataset whose bounds should be transformed.
+        target_crs: Coordinate reference system accepted by Rasterio for the
+            returned bounds.
+
+    Returns:
+        Tuple of ``(left, bottom, right, top)`` bounds in ``target_crs``.
+
+    Raises:
+        ValueError: If ``raster`` has no CRS.
+    """
     if raster.crs is None:
         raise ValueError(f"Raster has no CRS and cannot be combined: {raster.name}")
     return transform_bounds(
