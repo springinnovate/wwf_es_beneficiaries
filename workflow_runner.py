@@ -1804,7 +1804,16 @@ def _iter_block_windows(window: Window, block_size: int = RASTER_BLOCK_SIZE):
 
 
 def _create_zeroed_raster(target_path: Path, profile: dict) -> None:
-    """Create a zero-filled tiled raster so later window max writes are safe."""
+    """Create a zero-filled raster for later windowed max writes.
+
+    Args:
+        target_path: Path where the output raster should be created.
+        profile: Rasterio profile describing the target raster. The profile is
+            expected to include the 256 x 256 tiled GeoTIFF creation options.
+
+    Returns:
+        None.
+    """
     target_path.parent.mkdir(parents=True, exist_ok=True)
     dtype = np.dtype(profile["dtype"])
     block_count = math.ceil(profile["width"] / RASTER_BLOCK_SIZE) * math.ceil(
