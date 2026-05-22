@@ -323,6 +323,7 @@ def process_config(config_path: Path) -> Dict[str, Any]:
                 - 'subwatershed_vector_path' (str)
                 - 'aoi_vector_pattern' (list[str])
                 - 'analyze_full_raster_extent' (bool)
+                - 'debug_drain_index' (int | None)
             - 'masks' (list[dict]): Each item has 'id' (str), 'type' (str),
               and 'params' (dict).
             - 'combine' (list[dict]): As provided in the YAML 'combine'
@@ -379,6 +380,20 @@ def process_config(config_path: Path) -> Dict[str, Any]:
             "`inputs.analyze_full_raster_extent` must be true or false, "
             f"got {analyze_full_raster_extent!r}"
         )
+    debug_drain_index = inputs.get("debug_drain_index", None)
+    if debug_drain_index is not None:
+        if isinstance(debug_drain_index, bool) or not isinstance(
+            debug_drain_index, int
+        ):
+            raise ValueError(
+                "`inputs.debug_drain_index` must be a non-negative integer, "
+                f"got {debug_drain_index!r}"
+            )
+        if debug_drain_index < 0:
+            raise ValueError(
+                "`inputs.debug_drain_index` must be a non-negative integer, "
+                f"got {debug_drain_index}"
+            )
 
     wgs84_pixel_size = inputs.get("wgs84_pixel_size", None)
     travel_time_pixel_size_m = inputs.get("travel_time_pixel_size_m", None)
@@ -493,6 +508,13 @@ def process_config(config_path: Path) -> Dict[str, Any]:
 
     if errors:
         raise ValueError("Invalid sections:\n  - " + "\n  - ".join(errors))
+    if debug_drain_index is not None and not any(
+        mask_section.get("type") == "conditional_raster" for mask_section in masks
+    ):
+        raise ValueError(
+            "`inputs.debug_drain_index` can only be used when at least one "
+            "conditional_raster mask is configured."
+        )
     logging_cfg = raw_yaml.get("logging", {}) or {}
     log_level = logging_cfg.get("level", "INFO")
     log_to_file = logging_cfg.get("to_file", "")
@@ -508,6 +530,7 @@ def process_config(config_path: Path) -> Dict[str, Any]:
             "dem_raster_path": Path(dem_raster_path),
             "aoi_vector_pattern": aoi_vector_pattern,
             "analyze_full_raster_extent": analyze_full_raster_extent,
+            "debug_drain_index": debug_drain_index,
             "wgs84_pixel_size": float(wgs84_pixel_size),
             "travel_time_pixel_size_m": float(travel_time_pixel_size_m),
             "buffer_size_m": float(buffer_size_m),
@@ -963,6 +986,7 @@ def partition_subwatersheds_by_terminal_drain(
     subwatershed_vector_path: str | Path,
     target_crs: PickedCRS,
     target_partition_dir: str | Path,
+    debug_drain_index: int | None = None,
 ) -> dict[str, Path]:
     """Write downstream subwatershed partitions grouped by terminal drain.
 
@@ -973,6 +997,8 @@ def partition_subwatersheds_by_terminal_drain(
         target_crs: CRS to use for the written partition vectors.
         target_partition_dir: Directory where partition GeoPackages should be
             written.
+        debug_drain_index: Optional zero-based index into the sorted terminal
+            drain partitions. If set, only that partition is read and written.
 
     Returns:
         Mapping from partition id to the written partition vector path. Each
@@ -980,8 +1006,9 @@ def partition_subwatersheds_by_terminal_drain(
         ``NEXT_SINK`` id.
 
     Raises:
-        ValueError: If the AOI does not intersect subwatersheds or the
-            downstream graph is incomplete.
+        ValueError: If the AOI does not intersect subwatersheds, the
+            downstream graph is incomplete, or ``debug_drain_index`` is outside
+            the available partition range.
     """
     logger = logging.getLogger(__name__)
     logger.info(f"partitioning downstream subwatersheds from {aoi_vector_path}")
@@ -1090,10 +1117,41 @@ def partition_subwatersheds_by_terminal_drain(
             raise ValueError(f"Could not find NEXT_SINK for HYBAS_ID {hybas_id}.")
         ids_by_next_sink[next_sink_id].add(hybas_id)
 
+    target_partition_dir = Path(target_partition_dir)
+    target_partition_dir.mkdir(parents=True, exist_ok=True)
+
+    partition_items = sorted(ids_by_next_sink.items())
+    full_partition_count = len(partition_items)
+    if debug_drain_index is not None:
+        if not partition_items:
+            raise ValueError(
+                "`inputs.debug_drain_index` was set, but no drain partitions "
+                "are available."
+            )
+        if debug_drain_index >= full_partition_count:
+            raise ValueError(
+                "`inputs.debug_drain_index` is out of range: "
+                f"{debug_drain_index}. Available drain partition index range is "
+                f"0-{full_partition_count - 1}."
+            )
+        partition_items = [partition_items[debug_drain_index]]
+        selected_partition_id = f"drain_{partition_items[0][0]}"
+        logger.info(
+            "debug_drain_index=%d selected %s; writing 1 of %d drain partitions",
+            debug_drain_index,
+            selected_partition_id,
+            full_partition_count,
+        )
+
+    ids_to_read = set()
+    for _, partition_ids in partition_items:
+        ids_to_read.update(partition_ids)
+
     downstream_features = []
-    total_chunks = (len(visited_ids) + 999) // 1000
+    chunk_size = 1000
+    total_chunks = math.ceil(len(ids_to_read) / chunk_size)
     for id_chunk in tqdm(
-        _chunks(sorted(visited_ids), 1000),
+        _chunks(sorted(ids_to_read), chunk_size),
         desc="read downstream watershed geometries",
         total=total_chunks,
         unit="chunk",
@@ -1130,11 +1188,7 @@ def partition_subwatersheds_by_terminal_drain(
         sub_gdf = sub_gdf.to_crs(aoi_crs)
     sub_gdf = sub_gdf.to_crs(target_crs.crs)
 
-    target_partition_dir = Path(target_partition_dir)
-    target_partition_dir.mkdir(parents=True, exist_ok=True)
-
     partition_paths = {}
-    partition_items = sorted(ids_by_next_sink.items())
     for next_sink_id, partition_ids in tqdm(
         partition_items,
         desc="write drain partitions",
@@ -2024,6 +2078,7 @@ def main() -> None:
     has_conditional_mask = any(
         mask.get("type") == "conditional_raster" for mask in config.get("masks", [])
     )
+    debug_drain_index = config["inputs"].get("debug_drain_index")
 
     aoi_work_items = {}
     for aoi_key, aoi_vector_path in aoi_id_to_path.items():
@@ -2036,7 +2091,16 @@ def main() -> None:
                 config["inputs"]["subwatershed_vector_path"],
                 picked_crs,
                 working_dir / "drain_partitions",
+                debug_drain_index=debug_drain_index,
             )
+            if debug_drain_index is not None:
+                selected_partition_id = next(iter(partition_paths))
+                logger.info(
+                    "keeping debug intermediates for %s %s in %s",
+                    aoi_key,
+                    selected_partition_id,
+                    working_dir / selected_partition_id,
+                )
         else:
             partition_paths = {}
         aoi_work_items[aoi_key] = {
