@@ -2085,6 +2085,7 @@ def main() -> None:
         working_dir = Path(config["work_dir"]) / Path(aoi_key)
         working_dir.mkdir(parents=True, exist_ok=True)
         picked_crs = choose_equidistant_crs_from_bbox(aoi_vector_path)
+        travel_time_aoi_vector_path = aoi_vector_path
         if has_conditional_mask:
             partition_paths = partition_subwatersheds_by_terminal_drain(
                 aoi_vector_path,
@@ -2095,16 +2096,23 @@ def main() -> None:
             )
             if debug_drain_index is not None:
                 selected_partition_id = next(iter(partition_paths))
+                travel_time_aoi_vector_path = partition_paths[selected_partition_id]
                 logger.info(
                     "keeping debug intermediates for %s %s in %s",
                     aoi_key,
                     selected_partition_id,
                     working_dir / selected_partition_id,
                 )
+                logger.info(
+                    "using %s as the travel-time AOI for debug_drain_index=%d",
+                    travel_time_aoi_vector_path,
+                    debug_drain_index,
+                )
         else:
             partition_paths = {}
         aoi_work_items[aoi_key] = {
             "aoi_vector_path": aoi_vector_path,
+            "travel_time_aoi_vector_path": travel_time_aoi_vector_path,
             "target_crs": picked_crs,
             "working_dir": working_dir,
             "partition_paths": partition_paths,
@@ -2205,7 +2213,7 @@ def main() -> None:
                     args=(
                         config["inputs"]["traveltime_raster_path"],
                         config["inputs"]["population_raster_path"],
-                        aoi_vector_path,
+                        aoi_info["travel_time_aoi_vector_path"],
                         mask_section["params"]["max_hours"],
                         aoi_info["target_crs"].crs,
                         target_pop_raster_path,
