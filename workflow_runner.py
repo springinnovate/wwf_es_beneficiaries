@@ -62,6 +62,7 @@ RASTER_BLOCK_SIZE = 256
 HEARTBEAT_INTERVAL_SECONDS = 60
 TRAVEL_TIME_MAX_DISTANCE_M_PER_HOUR = 104_000
 POPULATION_COMBINE_VRT_NODATA = -1
+DISTANCE_TRANSFORM_NODATA = -1
 GTIFF_CREATION_OPTIONS = (
     "TILED=YES",
     "BIGTIFF=YES",
@@ -1387,6 +1388,7 @@ def apply_travel_time_mask(
     target_crs: str,
     target_pop_raster_path: Path,
     working_dir: Path,
+    use_wgs84_bounds_mask: bool = False,
 ):
     """
     Create a travel-time mask clipped to an AOI.
@@ -1397,6 +1399,10 @@ def apply_travel_time_mask(
         aoi_vector_path (str | Path): Path to a vector dataset (e.g. Shapefile,
             GeoPackage) defining the area of interest to clip to.
         max_hours (float): Maximum travel time in hours to include.
+        use_wgs84_bounds_mask (bool): If true, rasterize the AOI as a WGS84
+            bounds mask from pixel centers. This is intended for generated
+            full-extent AOIs, where projecting a near-global rectangle into a
+            local projected CRS can collapse the rasterized mask.
 
     Returns:
         rasterio.io.DatasetReader: An in-memory raster mask where pixels within
@@ -1406,6 +1412,7 @@ def apply_travel_time_mask(
     max_time_mins = max_hours * 60
 
     aoi_vector = gpd.read_file(aoi_vector_path)
+    aoi_wgs84_bounds = aoi_vector.to_crs("EPSG:4326").total_bounds
     projected_gdf = aoi_vector.to_crs(target_crs)
     bbox = projected_gdf.total_bounds
     # This max-distance bound is precomputed for the global friction raster
@@ -1448,13 +1455,22 @@ def apply_travel_time_mask(
         reference_meta=ref_meta,
     )
 
-    mask_array = rasterio.features.rasterize(
-        ((geom, 1) for geom in projected_gdf.geometry),
-        out_shape=(ref_meta["height"], ref_meta["width"]),
-        transform=ref_meta["transform"],
-        fill=0,
-        dtype=rasterio.uint8,
-    ).astype(np.int8)
+    if use_wgs84_bounds_mask:
+        mask_array = _rasterize_wgs84_bounds_mask(
+            aoi_wgs84_bounds,
+            ref_meta["transform"],
+            ref_meta["crs"],
+            ref_meta["height"],
+            ref_meta["width"],
+        )
+    else:
+        mask_array = rasterio.features.rasterize(
+            ((geom, 1) for geom in projected_gdf.geometry),
+            out_shape=(ref_meta["height"], ref_meta["width"]),
+            transform=ref_meta["transform"],
+            fill=0,
+            dtype=rasterio.uint8,
+        ).astype(np.int8)
 
     aoi_meta = ref_meta.copy()
     aoi_meta.update(
@@ -1501,7 +1517,11 @@ def apply_travel_time_mask(
     return _sum_raster_blocks(target_pop_raster_path)
 
 
-def create_distance_transform(base_mask_raster_path, target_distance_transform_path):
+def create_distance_transform(
+    base_mask_raster_path,
+    target_distance_transform_path,
+    target_nodata=DISTANCE_TRANSFORM_NODATA,
+):
     """Create a distance-transform raster from a binary mask.
 
     This function computes a distance transform on a binary mask raster using
@@ -1517,6 +1537,8 @@ def create_distance_transform(base_mask_raster_path, target_distance_transform_p
             non-source.
         target_distance_transform_path: Path-like specifying where the
             output distance-transform GeoTIFF should be written.
+        target_nodata: Nodata value to assign to pixels that GDAL proximity
+            does not compute.
 
     Returns:
         None
@@ -1536,11 +1558,14 @@ def create_distance_transform(base_mask_raster_path, target_distance_transform_p
 
     target_raster.SetGeoTransform(base_raster.GetGeoTransform())
     target_raster.SetProjection(base_raster.GetProjection())
+    target_band = target_raster.GetRasterBand(1)
+    target_band.SetNoDataValue(target_nodata)
+    target_band.Fill(target_nodata)
 
     gdal.ComputeProximity(
         src_band,
-        target_raster.GetRasterBand(1),
-        ["VALUES=1", "DISTUNITS=PIXEL"],
+        target_band,
+        ["VALUES=1", "DISTUNITS=PIXEL", f"NODATA={target_nodata}"],
     )
 
     target_raster = None
@@ -1696,7 +1721,7 @@ def calculate_ds_pop_from_conditional_raster(
 
         def _distance_mask_op(mask, n_pixels):
             return (
-                (n_pixels > 0)
+                (n_pixels != DISTANCE_TRANSFORM_NODATA)
                 & mask.astype(bool)
                 & (n_pixels * travel_time_pixel_size_m <= max_downstream_distance_m)
             )
@@ -1897,6 +1922,45 @@ def _iter_block_windows(window: Window, block_size: int = RASTER_BLOCK_SIZE):
         for col_off in range(col_start, col_stop, block_size):
             block_width = min(block_size, col_stop - col_off)
             yield Window(col_off, row_off, block_width, block_height)
+
+
+def _rasterize_wgs84_bounds_mask(
+    bounds_wgs84,
+    target_transform,
+    target_crs,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    """Create a binary mask from WGS84 bounds using target pixel centers.
+
+    This avoids projecting and rasterizing a near-global WGS84 polygon into a
+    local projected CRS, which can collapse the rasterized geometry near the
+    projection seam.
+    """
+    minx, miny, maxx, maxy = bounds_wgs84
+    transformer = Transformer.from_crs(target_crs, "EPSG:4326", always_xy=True)
+    mask_array = np.zeros((height, width), dtype=np.int8)
+    full_window = Window(0, 0, width, height)
+    for window in _iter_block_windows(full_window):
+        row_start = int(window.row_off)
+        row_stop = row_start + int(window.height)
+        col_start = int(window.col_off)
+        col_stop = col_start + int(window.width)
+        rows = np.arange(row_start, row_stop, dtype=np.float64) + 0.5
+        cols = np.arange(col_start, col_stop, dtype=np.float64) + 0.5
+        col_grid, row_grid = np.meshgrid(cols, rows)
+        x_grid, y_grid = target_transform * (col_grid, row_grid)
+        lon_grid, lat_grid = transformer.transform(x_grid, y_grid)
+        valid_lon_lat = np.isfinite(lon_grid) & np.isfinite(lat_grid)
+        if minx <= maxx:
+            inside_lon = (lon_grid >= minx) & (lon_grid <= maxx)
+        else:
+            inside_lon = (lon_grid >= minx) | (lon_grid <= maxx)
+        inside_lat = (lat_grid >= miny) & (lat_grid <= maxy)
+        mask_array[row_start:row_stop, col_start:col_stop] = (
+            valid_lon_lat & inside_lon & inside_lat
+        ).astype(np.int8)
+    return mask_array
 
 
 def _create_zeroed_raster(target_path: Path, profile: dict) -> None:
@@ -2250,6 +2314,10 @@ def main() -> None:
             if mask_section["type"] == "travel_time_population":
                 travel_time_working_dir = working_dir / section_id
                 travel_time_working_dir.mkdir(parents=True, exist_ok=True)
+                use_wgs84_bounds_mask = (
+                    aoi_key == FULL_RASTER_EXTENT_AOI_ID
+                    and debug_drain_index is None
+                )
 
                 travel_task = task_graph.add_task(
                     func=apply_travel_time_mask,
@@ -2261,6 +2329,7 @@ def main() -> None:
                         aoi_info["target_crs"].crs,
                         target_pop_raster_path,
                         travel_time_working_dir,
+                        use_wgs84_bounds_mask,
                     ),
                     store_result=True,
                     target_path_list=[target_pop_raster_path],
