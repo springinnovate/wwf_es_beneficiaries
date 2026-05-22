@@ -1148,9 +1148,10 @@ def partition_subwatersheds_by_terminal_drain(
         ids_to_read.update(partition_ids)
 
     downstream_features = []
-    total_chunks = (len(ids_to_read) + 999) // 1000
+    chunk_size = 1000
+    total_chunks = math.ceil(len(ids_to_read) / chunk_size)
     for id_chunk in tqdm(
-        _chunks(sorted(ids_to_read), 1000),
+        _chunks(sorted(ids_to_read), chunk_size),
         desc="read downstream watershed geometries",
         total=total_chunks,
         unit="chunk",
