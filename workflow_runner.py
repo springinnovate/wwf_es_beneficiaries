@@ -841,6 +841,24 @@ def _sum_raster_blocks(raster_path):
     return total
 
 
+def _minimum_positive_raster_value(raster_path: str | Path) -> float:
+    """Return the minimum finite raster value greater than 0."""
+    min_value = math.inf
+    with rasterio.open(raster_path) as raster:
+        nodata = raster.nodata
+        for _, window in raster.block_windows(1):
+            block = raster.read(1, window=window)
+            valid_mask = np.isfinite(block) & (block > 0)
+            if nodata is not None:
+                valid_mask &= block != nodata
+            if np.any(valid_mask):
+                min_value = min(min_value, float(np.min(block[valid_mask])))
+
+    if not math.isfinite(min_value):
+        raise ValueError(f"No positive finite values found in {raster_path}.")
+    return min_value
+
+
 def subset_subwatersheds(
     aoi_vector_path: str | Path,
     subwatershed_vector_path: str | Path,
@@ -1368,7 +1386,17 @@ def apply_travel_time_mask(
     aoi_vector = gpd.read_file(aoi_vector_path)
     projected_gdf = aoi_vector.to_crs(target_crs)
     bbox = projected_gdf.total_bounds
-    buffer_distance_m = max_hours * 104 * 1000  # drive 65mph for that many hours
+    min_friction = _minimum_positive_raster_value(traveltime_raster_path)
+    # shortest_distances multiplies friction by edge length in meters, so the
+    # friction values are travel time in minutes per meter.
+    buffer_distance_m = max_time_mins / min_friction
+    logger.info(
+        "travel-time clip buffer is %.2f m from min friction %.6g min/m "
+        "and max time %.1f min",
+        buffer_distance_m,
+        min_friction,
+        max_time_mins,
+    )
 
     buffered_bbox = box(
         bbox[0] - buffer_distance_m,
