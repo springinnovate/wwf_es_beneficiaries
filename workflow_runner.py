@@ -60,6 +60,7 @@ import shortest_distances
 
 RASTER_BLOCK_SIZE = 256
 HEARTBEAT_INTERVAL_SECONDS = 60
+TRAVEL_TIME_MAX_DISTANCE_M_PER_HOUR = 104_000
 GTIFF_CREATION_OPTIONS = (
     "TILED=YES",
     "BIGTIFF=YES",
@@ -1232,6 +1233,44 @@ def align_and_resize_raster_stack_on_vector(
         [float(x) for x in gdf.total_bounds],
         raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
     )
+    for target_path in target_path_list:
+        mask_raster_to_vector(target_path, bounding_vector_path)
+
+
+def mask_raster_to_vector(raster_path: str | Path, vector_path: str | Path) -> None:
+    """Mask a raster in place to a vector geometry."""
+    vector_gdf = gpd.read_file(vector_path)
+    vector_gdf = vector_gdf.set_geometry(vector_gdf.geometry.make_valid())
+    if vector_gdf.empty:
+        raise ValueError(f"No geometries found in {vector_path}.")
+
+    with rasterio.open(raster_path, "r+") as raster:
+        if raster.crs is None:
+            raise ValueError(f"Raster has no CRS and cannot be masked: {raster_path}")
+        if vector_gdf.crs is None:
+            raise ValueError(f"Vector has no CRS and cannot mask raster: {vector_path}")
+        if vector_gdf.crs != raster.crs:
+            vector_gdf = vector_gdf.to_crs(raster.crs)
+
+        geometries = [
+            geom
+            for geom in vector_gdf.geometry
+            if geom is not None and not geom.is_empty
+        ]
+        if not geometries:
+            raise ValueError(f"No valid geometries found in {vector_path}.")
+
+        outside_value = raster.nodata if raster.nodata is not None else 0
+        for _, window in raster.block_windows(1):
+            block = raster.read(1, window=window)
+            inside_mask = rasterio.features.geometry_mask(
+                geometries,
+                out_shape=(int(window.height), int(window.width)),
+                transform=rasterio.windows.transform(window, raster.transform),
+                invert=True,
+            )
+            block[~inside_mask] = outside_value
+            raster.write(block, 1, window=window)
 
 
 def eck4_limits(r=6371000):
@@ -1368,7 +1407,9 @@ def apply_travel_time_mask(
     aoi_vector = gpd.read_file(aoi_vector_path)
     projected_gdf = aoi_vector.to_crs(target_crs)
     bbox = projected_gdf.total_bounds
-    buffer_distance_m = max_hours * 104 * 1000  # drive 65mph for that many hours
+    # This max-distance bound is precomputed for the global friction raster
+    # used by this workflow.
+    buffer_distance_m = max_hours * TRAVEL_TIME_MAX_DISTANCE_M_PER_HOUR
 
     buffered_bbox = box(
         bbox[0] - buffer_distance_m,
@@ -2085,6 +2126,7 @@ def main() -> None:
         working_dir = Path(config["work_dir"]) / Path(aoi_key)
         working_dir.mkdir(parents=True, exist_ok=True)
         picked_crs = choose_equidistant_crs_from_bbox(aoi_vector_path)
+        travel_time_aoi_vector_path = aoi_vector_path
         if has_conditional_mask:
             partition_paths = partition_subwatersheds_by_terminal_drain(
                 aoi_vector_path,
@@ -2095,16 +2137,23 @@ def main() -> None:
             )
             if debug_drain_index is not None:
                 selected_partition_id = next(iter(partition_paths))
+                travel_time_aoi_vector_path = partition_paths[selected_partition_id]
                 logger.info(
                     "keeping debug intermediates for %s %s in %s",
                     aoi_key,
                     selected_partition_id,
                     working_dir / selected_partition_id,
                 )
+                logger.debug(
+                    "using %s as the travel-time AOI for debug_drain_index=%d",
+                    travel_time_aoi_vector_path,
+                    debug_drain_index,
+                )
         else:
             partition_paths = {}
         aoi_work_items[aoi_key] = {
             "aoi_vector_path": aoi_vector_path,
+            "travel_time_aoi_vector_path": travel_time_aoi_vector_path,
             "target_crs": picked_crs,
             "working_dir": working_dir,
             "partition_paths": partition_paths,
@@ -2205,7 +2254,7 @@ def main() -> None:
                     args=(
                         config["inputs"]["traveltime_raster_path"],
                         config["inputs"]["population_raster_path"],
-                        aoi_vector_path,
+                        aoi_info["travel_time_aoi_vector_path"],
                         mask_section["params"]["max_hours"],
                         aoi_info["target_crs"].crs,
                         target_pop_raster_path,
@@ -2233,10 +2282,11 @@ def main() -> None:
                     partition_pop_id_raster_list.append(
                         (partition_id, partition_pop_raster_path)
                     )
+                    partition_vector_path = aoi_info["partition_paths"][partition_id]
                     conditional_task = task_graph.add_task(
                         func=calculate_ds_pop_from_conditional_raster,
                         args=(
-                            aoi_vector_path,
+                            partition_vector_path,
                             partition_context["flow_dir_raster_path"],
                             partition_context["clipped_pop_raster_path"],
                             Path(mask_section["params"]["condition_raster_path"]),
