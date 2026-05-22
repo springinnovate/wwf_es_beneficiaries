@@ -2103,7 +2103,7 @@ def main() -> None:
                     selected_partition_id,
                     working_dir / selected_partition_id,
                 )
-                logger.info(
+                logger.debug(
                     "using %s as the travel-time AOI for debug_drain_index=%d",
                     travel_time_aoi_vector_path,
                     debug_drain_index,
