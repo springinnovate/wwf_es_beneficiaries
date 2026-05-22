@@ -61,6 +61,7 @@ import shortest_distances
 RASTER_BLOCK_SIZE = 256
 HEARTBEAT_INTERVAL_SECONDS = 60
 TRAVEL_TIME_MAX_DISTANCE_M_PER_HOUR = 104_000
+POPULATION_COMBINE_VRT_NODATA = -1
 GTIFF_CREATION_OPTIONS = (
     "TILED=YES",
     "BIGTIFF=YES",
@@ -2022,7 +2023,7 @@ def combine_pops(
                             "width": target.width,
                             "height": target.height,
                             "resampling": Resampling.nearest,
-                            "nodata": 0,
+                            "nodata": POPULATION_COMBINE_VRT_NODATA,
                         }
                         if source.nodata is not None:
                             vrt_kwargs["src_nodata"] = source.nodata
@@ -2033,6 +2034,7 @@ def combine_pops(
                                     1,
                                     window=window,
                                 ).astype(np.float32, copy=False)
+                                incoming[incoming < 0] = 0
                                 combine_state["pixels"] += int(
                                     window.width * window.height
                                 )
