@@ -387,29 +387,15 @@ def process_config(config_path: Path) -> Dict[str, Any]:
     missing_messages = []
     if not population_raster_path:
         missing_messages.append(f"population_raster_path {population_raster_path}")
-    elif not Path(population_raster_path).exists():
-        missing_messages.append(
-            f"population_raster_path does not exist: {population_raster_path}"
-        )
 
     if not traveltime_raster_path:
         missing_messages.append(f"traveltime_raster_path {traveltime_raster_path}")
-    elif not Path(traveltime_raster_path).exists():
-        missing_messages.append(
-            f"traveltime_raster_path does not exist: {traveltime_raster_path}"
-        )
 
     if not dem_raster_path:
         missing_messages.append("dem_raster_path (path to DEM raster)")
-    elif not Path(dem_raster_path).exists():
-        missing_messages.append(f"dem_raster_path does not exist: {dem_raster_path}")
 
     if not subwatershed_vector_path:
         missing_messages.append(f"subwatershed_vector_path {subwatershed_vector_path}")
-    elif not Path(subwatershed_vector_path).exists():
-        missing_messages.append(
-            f"subwatershed_vector_path does not exist: {subwatershed_vector_path}"
-        )
 
     if analyze_full_raster_extent and aoi_vector_pattern:
         missing_messages.append(
@@ -564,45 +550,66 @@ def setup_logger(level: str, log_file: str) -> logging.Logger:
 
 
 def validate_paths(config: Dict[str, Any]) -> None:
-    """Validate that required file paths exist in the configuration.
-
-    This function checks for the presence and existence of file paths in the
-    configuration dictionary. Glob patterns are skipped from existence checks.
-    All issues are collected, and if any are found, a single ``ValueError`` is
-    raised with a summary of the problems.
+    """Validate that configured input files exist on disk.
 
     Args:
-        config (Dict[str, Any]): Parsed configuration dictionary.
+        config: Parsed and normalized workflow configuration.
 
     Raises:
-        ValueError: If one or more required paths are missing or do not exist.
+        ValueError: If one or more required input paths are missing, do not
+            exist, or AOI glob patterns do not match any files.
     """
     issues: List[Tuple[str, str]] = []
 
-    def _check(path_like: Any, label: str) -> None:
+    def _has_glob_chars(path_str: str) -> bool:
+        return any(ch in path_str for ch in ["*", "?", "["])
+
+    def _check_file_path(path_like: Any, label: str) -> None:
         if not path_like:
             issues.append((label, "missing"))
             return
         path_str = os.fspath(path_like)
-        if any(ch in path_str for ch in ["*", "?", "["]):
-            # skip globs
+        if _has_glob_chars(path_str):
+            matches = glob.glob(path_str)
+            if not matches:
+                issues.append((label, f"no files matched pattern: {path_str}"))
             return
         if not os.path.exists(path_str):
             issues.append((label, f"not found: {path_str}"))
 
+    def _check_path_value(path_like: Any, label: str) -> None:
+        if isinstance(path_like, (list, tuple)):
+            for index, item in enumerate(path_like):
+                _check_file_path(item, f"{label}[{index}]")
+            return
+        _check_file_path(path_like, label)
+
     inputs = config.get("inputs", {})
-    for label in [
+    required_input_path_keys = [
         "population_raster_path",
         "traveltime_raster_path",
+        "dem_raster_path",
         "subwatershed_vector_path",
-    ]:
-        _check(inputs.get(label), label)
+    ]
+    checked_input_path_keys = set(required_input_path_keys)
+    for label in required_input_path_keys:
+        _check_file_path(inputs.get(label), f"inputs.{label}")
+
+    for key, val in inputs.items():
+        if key.endswith("_path") and key not in checked_input_path_keys:
+            _check_path_value(val, f"inputs.{key}")
+
+    if not inputs.get("analyze_full_raster_extent", False):
+        _check_path_value(
+            inputs.get("aoi_vector_pattern", []),
+            "inputs.aoi_vector_pattern",
+        )
 
     for i, mask_section in enumerate(config.get("masks", [])):
         params = mask_section.get("params", {}) or {}
         for key, val in params.items():
             if key.endswith("_path"):
-                _check(val, f"mask[{i}].params.{key}")
+                _check_path_value(val, f"masks[{i}].params.{key}")
 
     subwatershed_vector_path = inputs.get("subwatershed_vector_path")
     if subwatershed_vector_path and Path(subwatershed_vector_path).exists():
