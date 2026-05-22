@@ -1981,7 +1981,7 @@ def combine_pops(
                             "width": target.width,
                             "height": target.height,
                             "resampling": Resampling.nearest,
-                            "dst_nodata": 0,
+                            "nodata": 0,
                         }
                         if source.nodata is not None:
                             vrt_kwargs["src_nodata"] = source.nodata
