@@ -323,6 +323,7 @@ def process_config(config_path: Path) -> Dict[str, Any]:
                 - 'subwatershed_vector_path' (str)
                 - 'aoi_vector_pattern' (list[str])
                 - 'analyze_full_raster_extent' (bool)
+                - 'debug_drain_index' (int | None)
             - 'masks' (list[dict]): Each item has 'id' (str), 'type' (str),
               and 'params' (dict).
             - 'combine' (list[dict]): As provided in the YAML 'combine'
@@ -379,6 +380,20 @@ def process_config(config_path: Path) -> Dict[str, Any]:
             "`inputs.analyze_full_raster_extent` must be true or false, "
             f"got {analyze_full_raster_extent!r}"
         )
+    debug_drain_index = inputs.get("debug_drain_index", None)
+    if debug_drain_index is not None:
+        if isinstance(debug_drain_index, bool) or not isinstance(
+            debug_drain_index, int
+        ):
+            raise ValueError(
+                "`inputs.debug_drain_index` must be a non-negative integer, "
+                f"got {debug_drain_index!r}"
+            )
+        if debug_drain_index < 0:
+            raise ValueError(
+                "`inputs.debug_drain_index` must be a non-negative integer, "
+                f"got {debug_drain_index}"
+            )
 
     wgs84_pixel_size = inputs.get("wgs84_pixel_size", None)
     travel_time_pixel_size_m = inputs.get("travel_time_pixel_size_m", None)
@@ -493,6 +508,13 @@ def process_config(config_path: Path) -> Dict[str, Any]:
 
     if errors:
         raise ValueError("Invalid sections:\n  - " + "\n  - ".join(errors))
+    if debug_drain_index is not None and not any(
+        mask_section.get("type") == "conditional_raster" for mask_section in masks
+    ):
+        raise ValueError(
+            "`inputs.debug_drain_index` can only be used when at least one "
+            "conditional_raster mask is configured."
+        )
     logging_cfg = raw_yaml.get("logging", {}) or {}
     log_level = logging_cfg.get("level", "INFO")
     log_to_file = logging_cfg.get("to_file", "")
@@ -508,6 +530,7 @@ def process_config(config_path: Path) -> Dict[str, Any]:
             "dem_raster_path": Path(dem_raster_path),
             "aoi_vector_pattern": aoi_vector_pattern,
             "analyze_full_raster_extent": analyze_full_raster_extent,
+            "debug_drain_index": debug_drain_index,
             "wgs84_pixel_size": float(wgs84_pixel_size),
             "travel_time_pixel_size_m": float(travel_time_pixel_size_m),
             "buffer_size_m": float(buffer_size_m),
@@ -1996,6 +2019,44 @@ def calculate_taskgraph_worker_count(config: dict, work_unit_count: int) -> int:
     return min(desired_worker_count, physical_cpu_count)
 
 
+def filter_partition_paths_for_debug(
+    partition_paths: dict[str, Path],
+    debug_drain_index: int | None,
+) -> dict[str, Path]:
+    """Return one drain partition when single-drain debugging is enabled.
+
+    Args:
+        partition_paths: Mapping of drain partition ids to vector paths.
+        debug_drain_index: Optional zero-based index into the sorted drain
+            partition ids. If ``None``, all partitions are returned.
+
+    Returns:
+        Either ``partition_paths`` unchanged or a one-item mapping containing
+        the selected drain partition.
+
+    Raises:
+        ValueError: If ``debug_drain_index`` is outside the available
+            partition range.
+    """
+    if debug_drain_index is None:
+        return partition_paths
+
+    partition_items = sorted(partition_paths.items())
+    if debug_drain_index >= len(partition_items):
+        if not partition_items:
+            raise ValueError(
+                "`inputs.debug_drain_index` was set, but no drain partitions "
+                "are available."
+            )
+        raise ValueError(
+            "`inputs.debug_drain_index` is out of range: "
+            f"{debug_drain_index}. Available drain partition index range is "
+            f"0-{len(partition_items) - 1}."
+        )
+    partition_id, partition_path = partition_items[debug_drain_index]
+    return {partition_id: partition_path}
+
+
 def main() -> None:
     """Entry point."""
     ap = argparse.ArgumentParser(
@@ -2024,6 +2085,7 @@ def main() -> None:
     has_conditional_mask = any(
         mask.get("type") == "conditional_raster" for mask in config.get("masks", [])
     )
+    debug_drain_index = config["inputs"].get("debug_drain_index")
 
     aoi_work_items = {}
     for aoi_key, aoi_vector_path in aoi_id_to_path.items():
@@ -2037,6 +2099,22 @@ def main() -> None:
                 picked_crs,
                 working_dir / "drain_partitions",
             )
+            full_partition_count = len(partition_paths)
+            partition_paths = filter_partition_paths_for_debug(
+                partition_paths,
+                debug_drain_index,
+            )
+            if debug_drain_index is not None:
+                selected_partition_id = next(iter(partition_paths))
+                logger.info(
+                    "debug_drain_index=%d selected %s for %s; processing 1 "
+                    "of %d drain partitions and keeping intermediates in %s",
+                    debug_drain_index,
+                    selected_partition_id,
+                    aoi_key,
+                    full_partition_count,
+                    working_dir / selected_partition_id,
+                )
         else:
             partition_paths = {}
         aoi_work_items[aoi_key] = {

@@ -15,6 +15,9 @@ inputs:
   # the shared extent of the population, travel-time, DEM, and condition rasters.
   # When true, leave aoi_vector_pattern empty.
   analyze_full_raster_extent: false
+  # Optional debugging: process only one zero-based drain partition index.
+  # Start with 0 and increase to inspect a different sorted drain partition.
+  # debug_drain_index: 0
   aoi_vector_pattern:
     - "./data/aois/aoi_by_country/*.gpkg"
     - "./data/aois/WWF-Int_Pilot-sites/*/*.shp"
