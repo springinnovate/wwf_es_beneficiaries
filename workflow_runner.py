@@ -61,6 +61,7 @@ import shortest_distances
 RASTER_BLOCK_SIZE = 256
 HEARTBEAT_INTERVAL_SECONDS = 60
 TRAVEL_TIME_MAX_DISTANCE_M_PER_HOUR = 104_000
+DISTANCE_TRANSFORM_NODATA = -1
 GTIFF_CREATION_OPTIONS = (
     "TILED=YES",
     "BIGTIFF=YES",
@@ -1500,7 +1501,11 @@ def apply_travel_time_mask(
     return _sum_raster_blocks(target_pop_raster_path)
 
 
-def create_distance_transform(base_mask_raster_path, target_distance_transform_path):
+def create_distance_transform(
+    base_mask_raster_path,
+    target_distance_transform_path,
+    target_nodata=DISTANCE_TRANSFORM_NODATA,
+):
     """Create a distance-transform raster from a binary mask.
 
     This function computes a distance transform on a binary mask raster using
@@ -1516,6 +1521,8 @@ def create_distance_transform(base_mask_raster_path, target_distance_transform_p
             non-source.
         target_distance_transform_path: Path-like specifying where the
             output distance-transform GeoTIFF should be written.
+        target_nodata: Nodata value to assign to pixels that GDAL proximity
+            does not compute.
 
     Returns:
         None
@@ -1535,11 +1542,14 @@ def create_distance_transform(base_mask_raster_path, target_distance_transform_p
 
     target_raster.SetGeoTransform(base_raster.GetGeoTransform())
     target_raster.SetProjection(base_raster.GetProjection())
+    target_band = target_raster.GetRasterBand(1)
+    target_band.SetNoDataValue(target_nodata)
+    target_band.Fill(target_nodata)
 
     gdal.ComputeProximity(
         src_band,
-        target_raster.GetRasterBand(1),
-        ["VALUES=1", "DISTUNITS=PIXEL"],
+        target_band,
+        ["VALUES=1", "DISTUNITS=PIXEL", f"NODATA={target_nodata}"],
     )
 
     target_raster = None
@@ -1695,7 +1705,7 @@ def calculate_ds_pop_from_conditional_raster(
 
         def _distance_mask_op(mask, n_pixels):
             return (
-                (n_pixels > 0)
+                (n_pixels != DISTANCE_TRANSFORM_NODATA)
                 & mask.astype(bool)
                 & (n_pixels * travel_time_pixel_size_m <= max_downstream_distance_m)
             )
