@@ -986,6 +986,7 @@ def partition_subwatersheds_by_terminal_drain(
     subwatershed_vector_path: str | Path,
     target_crs: PickedCRS,
     target_partition_dir: str | Path,
+    debug_drain_index: int | None = None,
 ) -> dict[str, Path]:
     """Write downstream subwatershed partitions grouped by terminal drain.
 
@@ -996,6 +997,8 @@ def partition_subwatersheds_by_terminal_drain(
         target_crs: CRS to use for the written partition vectors.
         target_partition_dir: Directory where partition GeoPackages should be
             written.
+        debug_drain_index: Optional zero-based index into the sorted terminal
+            drain partitions. If set, only that partition is read and written.
 
     Returns:
         Mapping from partition id to the written partition vector path. Each
@@ -1003,8 +1006,9 @@ def partition_subwatersheds_by_terminal_drain(
         ``NEXT_SINK`` id.
 
     Raises:
-        ValueError: If the AOI does not intersect subwatersheds or the
-            downstream graph is incomplete.
+        ValueError: If the AOI does not intersect subwatersheds, the
+            downstream graph is incomplete, or ``debug_drain_index`` is outside
+            the available partition range.
     """
     logger = logging.getLogger(__name__)
     logger.info(f"partitioning downstream subwatersheds from {aoi_vector_path}")
@@ -1113,10 +1117,40 @@ def partition_subwatersheds_by_terminal_drain(
             raise ValueError(f"Could not find NEXT_SINK for HYBAS_ID {hybas_id}.")
         ids_by_next_sink[next_sink_id].add(hybas_id)
 
+    target_partition_dir = Path(target_partition_dir)
+    target_partition_dir.mkdir(parents=True, exist_ok=True)
+
+    partition_items = sorted(ids_by_next_sink.items())
+    full_partition_count = len(partition_items)
+    if debug_drain_index is not None:
+        if not partition_items:
+            raise ValueError(
+                "`inputs.debug_drain_index` was set, but no drain partitions "
+                "are available."
+            )
+        if debug_drain_index >= full_partition_count:
+            raise ValueError(
+                "`inputs.debug_drain_index` is out of range: "
+                f"{debug_drain_index}. Available drain partition index range is "
+                f"0-{full_partition_count - 1}."
+            )
+        partition_items = [partition_items[debug_drain_index]]
+        selected_partition_id = f"drain_{partition_items[0][0]}"
+        logger.info(
+            "debug_drain_index=%d selected %s; writing 1 of %d drain partitions",
+            debug_drain_index,
+            selected_partition_id,
+            full_partition_count,
+        )
+
+    ids_to_read = set()
+    for _, partition_ids in partition_items:
+        ids_to_read.update(partition_ids)
+
     downstream_features = []
-    total_chunks = (len(visited_ids) + 999) // 1000
+    total_chunks = (len(ids_to_read) + 999) // 1000
     for id_chunk in tqdm(
-        _chunks(sorted(visited_ids), 1000),
+        _chunks(sorted(ids_to_read), 1000),
         desc="read downstream watershed geometries",
         total=total_chunks,
         unit="chunk",
@@ -1153,11 +1187,7 @@ def partition_subwatersheds_by_terminal_drain(
         sub_gdf = sub_gdf.to_crs(aoi_crs)
     sub_gdf = sub_gdf.to_crs(target_crs.crs)
 
-    target_partition_dir = Path(target_partition_dir)
-    target_partition_dir.mkdir(parents=True, exist_ok=True)
-
     partition_paths = {}
-    partition_items = sorted(ids_by_next_sink.items())
     for next_sink_id, partition_ids in tqdm(
         partition_items,
         desc="write drain partitions",
@@ -2019,44 +2049,6 @@ def calculate_taskgraph_worker_count(config: dict, work_unit_count: int) -> int:
     return min(desired_worker_count, physical_cpu_count)
 
 
-def filter_partition_paths_for_debug(
-    partition_paths: dict[str, Path],
-    debug_drain_index: int | None,
-) -> dict[str, Path]:
-    """Return one drain partition when single-drain debugging is enabled.
-
-    Args:
-        partition_paths: Mapping of drain partition ids to vector paths.
-        debug_drain_index: Optional zero-based index into the sorted drain
-            partition ids. If ``None``, all partitions are returned.
-
-    Returns:
-        Either ``partition_paths`` unchanged or a one-item mapping containing
-        the selected drain partition.
-
-    Raises:
-        ValueError: If ``debug_drain_index`` is outside the available
-            partition range.
-    """
-    if debug_drain_index is None:
-        return partition_paths
-
-    partition_items = sorted(partition_paths.items())
-    if debug_drain_index >= len(partition_items):
-        if not partition_items:
-            raise ValueError(
-                "`inputs.debug_drain_index` was set, but no drain partitions "
-                "are available."
-            )
-        raise ValueError(
-            "`inputs.debug_drain_index` is out of range: "
-            f"{debug_drain_index}. Available drain partition index range is "
-            f"0-{len(partition_items) - 1}."
-        )
-    partition_id, partition_path = partition_items[debug_drain_index]
-    return {partition_id: partition_path}
-
-
 def main() -> None:
     """Entry point."""
     ap = argparse.ArgumentParser(
@@ -2098,21 +2090,14 @@ def main() -> None:
                 config["inputs"]["subwatershed_vector_path"],
                 picked_crs,
                 working_dir / "drain_partitions",
-            )
-            full_partition_count = len(partition_paths)
-            partition_paths = filter_partition_paths_for_debug(
-                partition_paths,
-                debug_drain_index,
+                debug_drain_index=debug_drain_index,
             )
             if debug_drain_index is not None:
                 selected_partition_id = next(iter(partition_paths))
                 logger.info(
-                    "debug_drain_index=%d selected %s for %s; processing 1 "
-                    "of %d drain partitions and keeping intermediates in %s",
-                    debug_drain_index,
-                    selected_partition_id,
+                    "keeping debug intermediates for %s %s in %s",
                     aoi_key,
-                    full_partition_count,
+                    selected_partition_id,
                     working_dir / selected_partition_id,
                 )
         else:
