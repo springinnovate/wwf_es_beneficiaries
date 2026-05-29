@@ -256,7 +256,7 @@ def _aligned_output_grid(
             "transform": from_origin(left, top, pixel_width, pixel_height),
         }
     )
-    if nodata_override is not None:
+    if profile.get("nodata") is None and nodata_override is not None:
         profile["nodata"] = nodata_override
     profile.update(DEFAULT_CREATION_OPTIONS)
     return profile, (left, bottom, right, top)
@@ -397,8 +397,9 @@ def stitch_rasters(
         raster_paths: Ordered raster paths to stitch. The first raster defines
             the output grid metadata.
         output_path: GeoTIFF path to create.
-        nodata_override: Optional nodata value to set on the output raster and
-            treat as nodata in every input raster.
+        nodata_override: Optional nodata value to use when the first raster has
+            no nodata metadata. When applied, this value is also treated as
+            nodata in every input raster.
 
     Returns:
         Resolved output raster path.
@@ -414,6 +415,12 @@ def stitch_rasters(
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    with rasterio.open(raster_paths[0]) as reference:
+        reference_nodata = reference.nodata
+    effective_nodata_override = (
+        nodata_override if reference_nodata is None else None
+    )
+
     _report_progress(
         progress_callback,
         "job_start",
@@ -423,7 +430,7 @@ def stitch_rasters(
     output_profile, _ = _aligned_output_grid(
         raster_paths,
         progress_callback,
-        nodata_override,
+        effective_nodata_override,
     )
     output_nodata = output_profile.get("nodata")
 
@@ -487,8 +494,8 @@ def stitch_rasters(
                 if output_nodata is not None:
                     vrt_kwargs["nodata"] = output_nodata
                 source_nodata = (
-                    nodata_override
-                    if nodata_override is not None
+                    effective_nodata_override
+                    if effective_nodata_override is not None
                     else source.nodata
                 )
                 if source_nodata is not None:
@@ -560,8 +567,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=_parse_nodata_value,
         default=None,
         help=(
-            "Override nodata for the stitched output and ignore this value "
-            "in every input raster."
+            "Use this nodata value when the first raster does not define one, "
+            "and ignore this value in every input raster."
         ),
     )
     parser.add_argument(

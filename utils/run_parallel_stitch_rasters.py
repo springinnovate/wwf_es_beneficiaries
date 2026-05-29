@@ -444,8 +444,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--nodata",
         default=None,
         help=(
-            "Override nodata for each stitched output and ignore this value "
-            "in every input raster."
+            "Use this nodata value when the first raster in a stitch job does "
+            "not define one, and ignore this value in every input raster."
         ),
     )
     return parser

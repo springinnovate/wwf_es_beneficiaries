@@ -69,6 +69,43 @@ class HighPerformanceStitchRastersTests(unittest.TestCase):
                 np.array([[1, 9], [10, 4]], dtype=np.int16),
             )
 
+    def test_reference_nodata_takes_precedence_over_override(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            raster_a_path = workspace_path / "a.tif"
+            raster_b_path = workspace_path / "b.tif"
+            output_path = workspace_path / "stitched.tif"
+
+            self._write_raster(
+                raster_a_path,
+                np.array([[1, 2], [3, 4]], dtype=np.int16),
+                0,
+                2,
+                nodata=-1,
+            )
+            self._write_raster(
+                raster_b_path,
+                np.array([[0, 9], [10, 0]], dtype=np.int16),
+                0,
+                2,
+                nodata=None,
+            )
+
+            stitch_rasters(
+                [raster_a_path, raster_b_path],
+                output_path,
+                nodata_override=0,
+            )
+
+            with rasterio.open(output_path) as stitched:
+                result = stitched.read(1)
+                self.assertEqual(stitched.nodata, -1)
+
+            np.testing.assert_array_equal(
+                result,
+                np.array([[0, 9], [10, 0]], dtype=np.int16),
+            )
+
     def test_stitches_adjacent_rasters_and_skips_nodata(self):
         with tempfile.TemporaryDirectory() as workspace:
             workspace_path = Path(workspace)
