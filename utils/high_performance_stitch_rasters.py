@@ -222,7 +222,15 @@ def _iter_block_windows(
     window: Window,
     block_size: int = DEFAULT_BLOCK_SIZE,
 ) -> Iterator[Window]:
-    """Yield block-sized windows within ``window``."""
+    """Yield fixed-size windows within a larger window.
+
+    Args:
+        window: Parent window to split into smaller processing windows.
+        block_size: Maximum width and height of each yielded window.
+
+    Yields:
+        ``Window`` objects that cover ``window`` without extending beyond it.
+    """
     row_start = int(window.row_off)
     col_start = int(window.col_off)
     row_stop = int(window.row_off + window.height)
