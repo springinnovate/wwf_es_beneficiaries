@@ -288,6 +288,18 @@ def stitch_rasters(
 
     Later rasters overwrite earlier rasters wherever the later raster has valid
     data. Source nodata pixels are skipped.
+
+    Args:
+        raster_paths: Ordered raster paths to stitch. The first raster defines
+            the output grid metadata.
+        output_path: GeoTIFF path to create.
+
+    Returns:
+        Resolved output raster path.
+
+    Raises:
+        ValueError: If no raster paths are provided or the rasters are not
+            compatible for stitching.
     """
     if not raster_paths:
         raise ValueError("At least one raster path is required.")
