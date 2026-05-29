@@ -363,7 +363,11 @@ def stitch_rasters(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Build the command-line argument parser."""
+    """Build the command-line argument parser.
+
+    Returns:
+        Configured argument parser for the standalone stitching CLI.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Stitch rasters listed in a text file into a common output grid. "
