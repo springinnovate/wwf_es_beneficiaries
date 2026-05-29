@@ -10,7 +10,7 @@ Example:
 
 The raster list should contain one path per line. Blank lines and lines whose
 first non-whitespace character is ``#`` are ignored. Relative paths are resolved
-relative to the list file.
+relative to the list file. UTF-8 and UTF-16 text files are supported.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ DEFAULT_CREATION_OPTIONS = {
     "blockxsize": DEFAULT_BLOCK_SIZE,
     "blockysize": DEFAULT_BLOCK_SIZE,
 }
+RASTER_LIST_ENCODINGS = ("utf-8-sig", "utf-16")
 
 
 def _progress(iterable: Iterable, **kwargs) -> Iterable:
@@ -65,25 +66,38 @@ def read_raster_list(list_path: Path) -> list[Path]:
 
     Raises:
         ValueError: If no raster paths are found.
+        UnicodeError: If the raster list is not a supported text encoding.
         FileNotFoundError: If a listed raster does not exist.
     """
     list_path = Path(list_path).resolve()
     raster_paths: list[Path] = []
-    with list_path.open("r", encoding="utf-8") as path_file:
-        for line_number, raw_line in enumerate(path_file, start=1):
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            raster_path = Path(line)
-            if not raster_path.is_absolute():
-                raster_path = list_path.parent / raster_path
-            raster_path = raster_path.resolve()
-            if not raster_path.exists():
-                raise FileNotFoundError(
-                    f"Raster listed on line {line_number} does not exist: "
-                    f"{raster_path}"
-                )
-            raster_paths.append(raster_path)
+    last_decode_error = None
+    for encoding in RASTER_LIST_ENCODINGS:
+        try:
+            lines = list_path.read_text(encoding=encoding).splitlines()
+            break
+        except UnicodeError as error:
+            last_decode_error = error
+    else:
+        raise UnicodeError(
+            f"Could not decode raster list as any supported encoding "
+            f"{RASTER_LIST_ENCODINGS}: {list_path}"
+        ) from last_decode_error
+
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        raster_path = Path(line)
+        if not raster_path.is_absolute():
+            raster_path = list_path.parent / raster_path
+        raster_path = raster_path.resolve()
+        if not raster_path.exists():
+            raise FileNotFoundError(
+                f"Raster listed on line {line_number} does not exist: "
+                f"{raster_path}"
+            )
+        raster_paths.append(raster_path)
 
     if not raster_paths:
         raise ValueError(f"No raster paths were found in {list_path}")

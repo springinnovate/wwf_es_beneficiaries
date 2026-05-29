@@ -109,6 +109,24 @@ class HighPerformanceStitchRastersTests(unittest.TestCase):
 
             self.assertEqual(read_raster_list(list_path), [raster_path])
 
+    def test_reads_utf16_list_file(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            raster_path = workspace_path / "a.tif"
+            list_path = workspace_path / "rasters.txt"
+            self._write_raster(
+                raster_path,
+                np.array([[1]], dtype=np.int16),
+                0,
+                1,
+            )
+            list_path.write_text(
+                "\n# comment\n" + raster_path.name + "\n",
+                encoding="utf-16",
+            )
+
+            self.assertEqual(read_raster_list(list_path), [raster_path])
+
 
 if __name__ == "__main__":
     unittest.main()
