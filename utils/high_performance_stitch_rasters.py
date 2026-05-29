@@ -195,7 +195,17 @@ def _aligned_output_grid(
 
 
 def _integer_window(raw_window: Window, width: int, height: int) -> Window:
-    """Round ``raw_window`` outward and clamp it to raster dimensions."""
+    """Round a window outward and clamp it to raster dimensions.
+
+    Args:
+        raw_window: Window with possibly fractional offsets or dimensions.
+        width: Raster width in pixels.
+        height: Raster height in pixels.
+
+    Returns:
+        Integer ``Window`` that covers ``raw_window`` and stays within the
+        raster dimensions.
+    """
     col_start = max(0, math.floor(raw_window.col_off))
     row_start = max(0, math.floor(raw_window.row_off))
     col_stop = min(width, math.ceil(raw_window.col_off + raw_window.width))
