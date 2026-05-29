@@ -260,7 +260,13 @@ def _valid_mask(data: np.ndarray, nodata) -> np.ndarray:
 
 
 def _initialize_output(target: rasterio.DatasetWriter, nodata) -> None:
-    """Fill the output raster with nodata when nodata is defined."""
+    """Fill an output raster with nodata when nodata is defined.
+
+    Args:
+        target: Open output raster dataset to initialize.
+        nodata: Nodata value to write into every output band and block. If
+            ``None``, no initialization is performed.
+    """
     if nodata is None:
         return
 
