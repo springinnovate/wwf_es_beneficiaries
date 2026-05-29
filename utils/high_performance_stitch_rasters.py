@@ -10,17 +10,23 @@ Example:
 
 The raster list should contain one path per line. Blank lines and lines whose
 first non-whitespace character is ``#`` are ignored. Relative paths are resolved
-relative to the list file.
+relative to the list file. UTF-8 and UTF-16 text files are supported.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import os
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
 import numpy as np
+
+DEFAULT_GDAL_CACHEMAX_MB = 256
+os.environ.setdefault("GDAL_CACHEMAX", str(DEFAULT_GDAL_CACHEMAX_MB))
+
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.transform import Affine, from_origin
@@ -35,6 +41,7 @@ except ImportError:  # pragma: no cover - tqdm is expected but not required.
 
 DEFAULT_BLOCK_SIZE = 256
 DEFAULT_IO_WINDOW_SIZE = DEFAULT_BLOCK_SIZE * 10
+PROGRESS_EVENT_PREFIX = "STITCH_PROGRESS "
 DEFAULT_CREATION_OPTIONS = {
     "BIGTIFF": "YES",
     "NUM_THREADS": "ALL_CPUS",
@@ -43,6 +50,8 @@ DEFAULT_CREATION_OPTIONS = {
     "blockxsize": DEFAULT_BLOCK_SIZE,
     "blockysize": DEFAULT_BLOCK_SIZE,
 }
+RASTER_LIST_ENCODINGS = ("utf-8-sig", "utf-16")
+ProgressCallback = Callable[[dict], None]
 
 
 def _progress(iterable: Iterable, **kwargs) -> Iterable:
@@ -50,6 +59,38 @@ def _progress(iterable: Iterable, **kwargs) -> Iterable:
     if tqdm is None:
         return iterable
     return tqdm(iterable, **kwargs)
+
+
+def _emit_progress_event(event: dict) -> None:
+    """Write one machine-readable progress event for parent runners."""
+    print(
+        PROGRESS_EVENT_PREFIX + json.dumps(event, sort_keys=True),
+        flush=True,
+    )
+
+
+def _report_progress(
+    progress_callback: ProgressCallback | None,
+    event: str,
+    **payload,
+) -> None:
+    """Send a progress event when a callback is configured."""
+    if progress_callback is None:
+        return
+    progress_callback({"event": event, **payload})
+
+
+def _parse_nodata_value(value: str):
+    """Parse a CLI nodata value as int where possible, otherwise float."""
+    lowered_value = value.lower()
+    if any(char in lowered_value for char in ".e") or lowered_value in {
+        "nan",
+        "inf",
+        "+inf",
+        "-inf",
+    }:
+        return float(value)
+    return int(value)
 
 
 def read_raster_list(list_path: Path) -> list[Path]:
@@ -65,25 +106,38 @@ def read_raster_list(list_path: Path) -> list[Path]:
 
     Raises:
         ValueError: If no raster paths are found.
+        UnicodeError: If the raster list is not a supported text encoding.
         FileNotFoundError: If a listed raster does not exist.
     """
     list_path = Path(list_path).resolve()
     raster_paths: list[Path] = []
-    with list_path.open("r", encoding="utf-8") as path_file:
-        for line_number, raw_line in enumerate(path_file, start=1):
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            raster_path = Path(line)
-            if not raster_path.is_absolute():
-                raster_path = list_path.parent / raster_path
-            raster_path = raster_path.resolve()
-            if not raster_path.exists():
-                raise FileNotFoundError(
-                    f"Raster listed on line {line_number} does not exist: "
-                    f"{raster_path}"
-                )
-            raster_paths.append(raster_path)
+    last_decode_error = None
+    for encoding in RASTER_LIST_ENCODINGS:
+        try:
+            lines = list_path.read_text(encoding=encoding).splitlines()
+            break
+        except UnicodeError as error:
+            last_decode_error = error
+    else:
+        raise UnicodeError(
+            f"Could not decode raster list as any supported encoding "
+            f"{RASTER_LIST_ENCODINGS}: {list_path}"
+        ) from last_decode_error
+
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        raster_path = Path(line)
+        if not raster_path.is_absolute():
+            raster_path = list_path.parent / raster_path
+        raster_path = raster_path.resolve()
+        if not raster_path.exists():
+            raise FileNotFoundError(
+                f"Raster listed on line {line_number} does not exist: "
+                f"{raster_path}"
+            )
+        raster_paths.append(raster_path)
 
     if not raster_paths:
         raise ValueError(f"No raster paths were found in {list_path}")
@@ -112,6 +166,8 @@ def _require_north_up(transform: Affine, raster_path: Path) -> None:
 
 def _aligned_output_grid(
     raster_paths: Sequence[Path],
+    progress_callback: ProgressCallback | None = None,
+    nodata_override=None,
 ) -> tuple[dict, tuple[float, float, float, float]]:
     """Build an output Rasterio profile from input rasters.
 
@@ -148,6 +204,13 @@ def _aligned_output_grid(
     maxx = -math.inf
     maxy = -math.inf
 
+    _report_progress(
+        progress_callback,
+        "stage_start",
+        stage="scan raster metadata",
+        total=len(raster_paths),
+        unit="raster",
+    )
     for raster_path in raster_paths:
         with rasterio.open(raster_path) as source:
             _require_north_up(source.transform, raster_path)
@@ -170,6 +233,8 @@ def _aligned_output_grid(
             miny = min(miny, source.bounds.bottom)
             maxx = max(maxx, source.bounds.right)
             maxy = max(maxy, source.bounds.top)
+        _report_progress(progress_callback, "progress", advance=1)
+    _report_progress(progress_callback, "stage_done")
 
     left = origin_x + math.floor((minx - origin_x) / pixel_width) * pixel_width
     right = origin_x + math.ceil((maxx - origin_x) / pixel_width) * pixel_width
@@ -191,6 +256,8 @@ def _aligned_output_grid(
             "transform": from_origin(left, top, pixel_width, pixel_height),
         }
     )
+    if profile.get("nodata") is None and nodata_override is not None:
+        profile["nodata"] = nodata_override
     profile.update(DEFAULT_CREATION_OPTIONS)
     return profile, (left, bottom, right, top)
 
@@ -243,6 +310,18 @@ def _iter_block_windows(
             yield Window(col_off, row_off, block_width, block_height)
 
 
+def _block_window_count(
+    window: Window,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+) -> int:
+    """Return the number of block windows needed to cover ``window``."""
+    if window.width == 0 or window.height == 0:
+        return 0
+    return math.ceil(window.height / block_size) * math.ceil(
+        window.width / block_size
+    )
+
+
 def _valid_mask(data: np.ndarray, nodata) -> np.ndarray:
     """Return a boolean mask for valid raster values.
 
@@ -260,7 +339,11 @@ def _valid_mask(data: np.ndarray, nodata) -> np.ndarray:
     return data != nodata
 
 
-def _initialize_output(target: rasterio.DatasetWriter, nodata) -> None:
+def _initialize_output(
+    target: rasterio.DatasetWriter,
+    nodata,
+    progress_callback: ProgressCallback | None = None,
+) -> None:
     """Fill an output raster with nodata when nodata is defined.
 
     Args:
@@ -268,22 +351,42 @@ def _initialize_output(target: rasterio.DatasetWriter, nodata) -> None:
         nodata: Nodata value to write into every output band and block. If
             ``None``, no initialization is performed.
     """
+    stage = "initialize output"
     if nodata is None:
+        _report_progress(
+            progress_callback,
+            "stage_start",
+            stage=stage,
+            total=0,
+            unit="block",
+        )
+        _report_progress(progress_callback, "stage_done")
         return
 
-    for _, window in _progress(
-        target.block_windows(1),
-        desc="initialize output",
+    block_count = sum(1 for _ in target.block_windows(1))
+    _report_progress(
+        progress_callback,
+        "stage_start",
+        stage=stage,
+        total=block_count,
         unit="block",
-    ):
+    )
+    block_windows = target.block_windows(1)
+    if progress_callback is None:
+        block_windows = _progress(block_windows, desc=stage, unit="block")
+    for _, window in block_windows:
         shape = (target.count, int(window.height), int(window.width))
         fill_block = np.full(shape, nodata, dtype=target.dtypes[0])
         target.write(fill_block, window=window)
+        _report_progress(progress_callback, "progress", advance=1)
+    _report_progress(progress_callback, "stage_done")
 
 
 def stitch_rasters(
     raster_paths: Sequence[Path],
     output_path: Path,
+    progress_callback: ProgressCallback | None = None,
+    nodata_override=None,
 ) -> Path:
     """Stitch ``raster_paths`` into ``output_path``.
 
@@ -294,6 +397,9 @@ def stitch_rasters(
         raster_paths: Ordered raster paths to stitch. The first raster defines
             the output grid metadata.
         output_path: GeoTIFF path to create.
+        nodata_override: Optional nodata value to use when the first raster has
+            no nodata metadata. When applied, this value is also treated as
+            nodata in every input raster.
 
     Returns:
         Resolved output raster path.
@@ -309,18 +415,38 @@ def stitch_rasters(
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    output_profile, _ = _aligned_output_grid(raster_paths)
+    with rasterio.open(raster_paths[0]) as reference:
+        reference_nodata = reference.nodata
+    effective_nodata_override = (
+        nodata_override if reference_nodata is None else None
+    )
+
+    _report_progress(
+        progress_callback,
+        "job_start",
+        total_sources=len(raster_paths),
+        output_path=str(output_path),
+    )
+    output_profile, _ = _aligned_output_grid(
+        raster_paths,
+        progress_callback,
+        effective_nodata_override,
+    )
     output_nodata = output_profile.get("nodata")
 
     with rasterio.open(output_path, "w", **output_profile) as output:
-        _initialize_output(output, output_nodata)
+        _initialize_output(output, output_nodata, progress_callback)
 
     with rasterio.open(output_path, "r+") as output:
-        for raster_path in _progress(
-            raster_paths,
-            desc="stitch rasters",
-            unit="raster",
-        ):
+        raster_iterable = enumerate(raster_paths, start=1)
+        if progress_callback is None:
+            raster_iterable = _progress(
+                raster_iterable,
+                desc="stitch rasters",
+                total=len(raster_paths),
+                unit="raster",
+            )
+        for raster_index, raster_path in raster_iterable:
             with rasterio.open(raster_path) as source:
                 # Map the source raster's world-coordinate bounds into the
                 # shared output grid so reads/writes stay limited to the part
@@ -331,7 +457,32 @@ def stitch_rasters(
                     output.height,
                 )
                 if target_window.width == 0 or target_window.height == 0:
+                    _report_progress(
+                        progress_callback,
+                        "stage_start",
+                        stage=(
+                            f"stitch {raster_index}/{len(raster_paths)}: "
+                            f"{raster_path.name}"
+                        ),
+                        total=0,
+                        unit="block",
+                    )
+                    _report_progress(progress_callback, "stage_done")
                     continue
+                block_count = _block_window_count(
+                    target_window,
+                    DEFAULT_IO_WINDOW_SIZE,
+                )
+                _report_progress(
+                    progress_callback,
+                    "stage_start",
+                    stage=(
+                        f"stitch {raster_index}/{len(raster_paths)}: "
+                        f"{raster_path.name}"
+                    ),
+                    total=block_count,
+                    unit="block",
+                )
 
                 vrt_kwargs = {
                     "crs": output.crs,
@@ -342,14 +493,19 @@ def stitch_rasters(
                 }
                 if output_nodata is not None:
                     vrt_kwargs["nodata"] = output_nodata
-                if source.nodata is not None:
-                    vrt_kwargs["src_nodata"] = source.nodata
+                source_nodata = (
+                    effective_nodata_override
+                    if effective_nodata_override is not None
+                    else source.nodata
+                )
+                if source_nodata is not None:
+                    vrt_kwargs["src_nodata"] = source_nodata
 
                 with WarpedVRT(source, **vrt_kwargs) as source_vrt:
                     effective_nodata = (
                         source_vrt.nodata
                         if source_vrt.nodata is not None
-                        else source.nodata
+                        else source_nodata
                     )
                     for window in _iter_block_windows(
                         target_window,
@@ -358,14 +514,27 @@ def stitch_rasters(
                         data = source_vrt.read(window=window)
                         valid = _valid_mask(data, effective_nodata)
                         if not np.any(valid):
+                            _report_progress(
+                                progress_callback,
+                                "progress",
+                                advance=1,
+                            )
                             continue
                         if np.all(valid):
                             output.write(data, window=window)
+                            _report_progress(
+                                progress_callback,
+                                "progress",
+                                advance=1,
+                            )
                             continue
                         existing = output.read(window=window)
                         existing[valid] = data[valid]
                         output.write(existing, window=window)
+                        _report_progress(progress_callback, "progress", advance=1)
+                _report_progress(progress_callback, "stage_done")
 
+    _report_progress(progress_callback, "job_done", output_path=str(output_path))
     return output_path
 
 
@@ -393,6 +562,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Output GeoTIFF path.",
     )
+    parser.add_argument(
+        "--nodata",
+        type=_parse_nodata_value,
+        default=None,
+        help=(
+            "Use this nodata value when the first raster does not define one, "
+            "and ignore this value in every input raster."
+        ),
+    )
+    parser.add_argument(
+        "--progress-json",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -401,8 +584,15 @@ def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
     raster_paths = read_raster_list(args.raster_list)
-    output_path = stitch_rasters(raster_paths, args.output_raster)
-    print(f"Wrote {output_path}")
+    progress_callback = _emit_progress_event if args.progress_json else None
+    output_path = stitch_rasters(
+        raster_paths,
+        args.output_raster,
+        progress_callback=progress_callback,
+        nodata_override=args.nodata,
+    )
+    if not args.progress_json:
+        print(f"Wrote {output_path}")
 
 
 if __name__ == "__main__":
