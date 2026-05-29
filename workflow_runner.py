@@ -1572,6 +1572,30 @@ def create_distance_transform(
     base_raster = None
 
 
+def condition_mask_op(value, base_raster_nodata, expression):
+    """Evaluate a conditional raster expression into a binary mask.
+
+    Source nodata pixels are always false. This keeps nodata values from
+    leaking into the downstream source mask as nonzero byte values.
+    """
+    result = np.zeros(value.shape, dtype=np.uint8)
+    valid_mask = (
+        np.ones(value.shape, dtype=bool)
+        if base_raster_nodata is None
+        else value != base_raster_nodata
+    )
+    if not np.any(valid_mask):
+        return result
+
+    expression_result = eval(
+        expression,
+        {"__builtins__": {}},
+        {"value": value[valid_mask], "np": np},
+    )
+    result[valid_mask] = np.asarray(expression_result).astype(bool).astype(np.uint8)
+    return result
+
+
 def calculate_ds_pop_from_conditional_raster(
     aoi_vector_path,
     flow_dir_raster_path,
@@ -1658,34 +1682,14 @@ def calculate_ds_pop_from_conditional_raster(
     base_raster_nodata = base_info["nodata"][0]
 
     def _local_op(value):
-        """Applies an elementwise expression to an array with nodata masking.
-
-        Note: `base_raster_nodata` and `expression` are provided in the outside
-            closure.
-
-        Args:
-            value (np.ndarray): Input array.
-
-        Returns:
-            np.ndarray: Array with the expression applied to valid elements.
-        """
-        result = value.copy()
-        valid_mask = (
-            slice(None) if base_raster_nodata is None else value != base_raster_nodata
-        )
-        result[valid_mask] = eval(
-            expression,
-            {"__builtins__": {}},
-            {"value": value[valid_mask], "np": np},
-        )
-        return result
+        return condition_mask_op(value, base_raster_nodata, expression)
 
     geoprocessing.raster_calculator(
         [(str(clipped_base_raster_path), 1)],
         _local_op,
         condition_raster_path,
         gdal.GDT_Byte,
-        None,
+        0,
         calc_raster_stats=False,
         raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
     )
@@ -2115,7 +2119,9 @@ def combine_pops(
 
     logger.info("wrote combined population raster %s", target_combined_pop_raster_path)
 
-    logger.info("summing combined population raster %s", target_combined_pop_raster_path)
+    logger.info(
+        "summing combined population raster %s", target_combined_pop_raster_path
+    )
     with _log_heartbeat(
         logger,
         lambda: f"summing combined population raster {target_combined_pop_raster_path}",
@@ -2315,8 +2321,7 @@ def main() -> None:
                 travel_time_working_dir = working_dir / section_id
                 travel_time_working_dir.mkdir(parents=True, exist_ok=True)
                 use_wgs84_bounds_mask = (
-                    aoi_key == FULL_RASTER_EXTENT_AOI_ID
-                    and debug_drain_index is None
+                    aoi_key == FULL_RASTER_EXTENT_AOI_ID and debug_drain_index is None
                 )
 
                 travel_task = task_graph.add_task(
