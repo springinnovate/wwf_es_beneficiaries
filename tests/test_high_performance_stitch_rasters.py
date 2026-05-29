@@ -7,12 +7,16 @@ import rasterio
 from rasterio.transform import from_origin
 
 from utils.high_performance_stitch_rasters import (
+    DEFAULT_GDAL_CACHEMAX_MB,
     read_raster_list,
     stitch_rasters,
 )
 
 
 class HighPerformanceStitchRastersTests(unittest.TestCase):
+
+    def test_uses_bounded_default_gdal_cache(self):
+        self.assertEqual(DEFAULT_GDAL_CACHEMAX_MB, 256)
 
     def _write_raster(self, path, array, left, top, nodata=-1):
         profile = {

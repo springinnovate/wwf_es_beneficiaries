@@ -18,10 +18,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
 
 import numpy as np
+
+DEFAULT_GDAL_CACHEMAX_MB = 256
+os.environ.setdefault("GDAL_CACHEMAX", str(DEFAULT_GDAL_CACHEMAX_MB))
+
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.transform import Affine, from_origin
