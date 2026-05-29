@@ -112,7 +112,22 @@ def _require_north_up(transform: Affine, raster_path: Path) -> None:
 def _aligned_output_grid(
     raster_paths: Sequence[Path],
 ) -> tuple[dict, tuple[float, float, float, float]]:
-    """Build an output Rasterio profile from input rasters."""
+    """Build an output Rasterio profile from input rasters.
+
+    Args:
+        raster_paths: Ordered input raster paths. The first raster defines the
+            output CRS, pixel size, dtype, band count, nodata, and grid origin.
+
+    Returns:
+        Tuple of ``(profile, bounds)`` where ``profile`` is the Rasterio output
+        profile and ``bounds`` is ``(left, bottom, right, top)`` in the output
+        CRS.
+
+    Raises:
+        ValueError: If the reference raster has no CRS, input rasters have
+            incompatible CRS/band/dtype metadata, any raster is not north-up,
+            or the combined output dimensions are invalid.
+    """
     with rasterio.open(raster_paths[0]) as reference:
         _require_north_up(reference.transform, raster_paths[0])
         reference_crs = reference.crs
