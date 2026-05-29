@@ -321,6 +321,9 @@ def stitch_rasters(
             unit="raster",
         ):
             with rasterio.open(raster_path) as source:
+                # Map the source raster's world-coordinate bounds into the
+                # shared output grid so reads/writes stay limited to the part
+                # of the output touched by this source.
                 target_window = _integer_window(
                     from_bounds(*source.bounds, transform=output.transform),
                     output.width,
