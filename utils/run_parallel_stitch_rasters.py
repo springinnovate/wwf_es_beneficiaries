@@ -14,8 +14,10 @@ import argparse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import glob
+import json
 import os
 from pathlib import Path
+import queue
 import subprocess
 import sys
 import time
@@ -23,6 +25,12 @@ from typing import Sequence
 
 
 DEFAULT_STATUS_INTERVAL_SECONDS = 30
+PROGRESS_EVENT_PREFIX = "STITCH_PROGRESS "
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - tqdm is expected but not required.
+    tqdm = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +141,7 @@ def run_stitch_job(
     job: StitchJob,
     stitcher_script_path: Path,
     python_executable: str,
+    progress_position: int | None = None,
 ) -> StitchResult:
     """Run one stitch job as a child Python process.
 
@@ -140,29 +149,91 @@ def run_stitch_job(
         job: Stitch job to execute.
         stitcher_script_path: Path to ``high_performance_stitch_rasters.py``.
         python_executable: Python executable used to launch the stitcher.
+        progress_position: Optional tqdm line position for this job's live
+            progress bar.
 
     Returns:
         ``StitchResult`` with captured output and runtime.
     """
     start_time = time.monotonic()
-    completed_process = subprocess.run(
+    process = subprocess.Popen(
         [
             python_executable,
             os.fspath(stitcher_script_path),
             os.fspath(job.raster_list_path),
             os.fspath(job.output_raster_path),
+            "--progress-json",
         ],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        check=False,
+        bufsize=1,
     )
+    output_lines = []
+    progress_bar = None
+    if tqdm is not None and progress_position is not None:
+        progress_bar = tqdm(
+            total=0,
+            desc=f"{job.raster_list_path.stem}: starting",
+            unit="step",
+            position=progress_position,
+            leave=False,
+            dynamic_ncols=True,
+        )
+    assert process.stdout is not None
+    try:
+        for raw_line in process.stdout:
+            line = raw_line.rstrip()
+            if not line:
+                continue
+            if line.startswith(PROGRESS_EVENT_PREFIX):
+                event = json.loads(line[len(PROGRESS_EVENT_PREFIX) :])
+                if progress_bar is not None:
+                    _update_job_progress_bar(progress_bar, job, event)
+                continue
+            output_lines.append(line)
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
+
+    returncode = process.wait()
     return StitchResult(
         job=job,
-        returncode=completed_process.returncode,
-        stdout=completed_process.stdout,
-        stderr=completed_process.stderr,
+        returncode=returncode,
+        stdout="\n".join(output_lines),
+        stderr="",
         elapsed_seconds=time.monotonic() - start_time,
     )
+
+
+def _short_progress_text(text: str, max_length: int = 34) -> str:
+    """Return a compact label for a tqdm progress row."""
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 1] + "..."
+
+
+def _update_job_progress_bar(
+    progress_bar,
+    job: StitchJob,
+    event: dict,
+) -> None:
+    """Apply one child-process progress event to a job progress bar."""
+    event_type = event.get("event")
+    if event_type == "stage_start":
+        stage = _short_progress_text(event["stage"])
+        progress_bar.reset(total=event.get("total", 0))
+        progress_bar.n = 0
+        progress_bar.unit = event.get("unit", "item")
+        progress_bar.set_description(
+            f"{_short_progress_text(job.raster_list_path.stem, 24)}: {stage}"
+        )
+        progress_bar.refresh()
+    elif event_type == "progress":
+        progress_bar.update(event.get("advance", 1))
+    elif event_type == "stage_done":
+        if progress_bar.total is not None and progress_bar.n < progress_bar.total:
+            progress_bar.update(progress_bar.total - progress_bar.n)
 
 
 def run_stitch_jobs(
@@ -193,56 +264,95 @@ def run_stitch_jobs(
 
     results: list[StitchResult] = []
     futures_to_jobs = {}
+    positions = queue.Queue()
+    for position in range(1, min(workers, len(jobs)) + 1):
+        positions.put(position)
     start_time = time.monotonic()
     last_status_time = start_time
+    overall_progress_bar = None
+    if tqdm is not None:
+        overall_progress_bar = tqdm(
+            total=len(jobs),
+            desc="stitch jobs",
+            unit="job",
+            position=0,
+            dynamic_ncols=True,
+        )
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        for job in jobs:
-            future = executor.submit(
-                run_stitch_job,
+    def run_job_with_progress_position(job: StitchJob) -> StitchResult:
+        position = positions.get()
+        try:
+            return run_stitch_job(
                 job,
                 stitcher_script_path,
                 python_executable,
+                progress_position=position,
             )
-            futures_to_jobs[future] = job
+        finally:
+            positions.put(position)
 
-        pending_futures = set(futures_to_jobs)
-        while pending_futures:
-            done_futures, pending_futures = wait(
-                pending_futures,
-                timeout=1,
-                return_when=FIRST_COMPLETED,
-            )
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for job in jobs:
+                future = executor.submit(run_job_with_progress_position, job)
+                futures_to_jobs[future] = job
 
-            for future in done_futures:
-                result = future.result()
-                results.append(result)
-                status = "ok" if result.returncode == 0 else "failed"
-                print(
-                    f"[{len(results)}/{len(jobs)}] {status}: "
-                    f"{result.job.raster_list_path.name} "
-                    f"({result.elapsed_seconds:.1f}s)"
+            pending_futures = set(futures_to_jobs)
+            while pending_futures:
+                done_futures, pending_futures = wait(
+                    pending_futures,
+                    timeout=1,
+                    return_when=FIRST_COMPLETED,
                 )
-                if result.stdout:
-                    print(result.stdout.rstrip())
-                if result.stderr:
-                    print(result.stderr.rstrip(), file=sys.stderr)
 
-            now = time.monotonic()
-            if (
-                pending_futures
-                and status_interval_seconds > 0
-                and now - last_status_time >= status_interval_seconds
-            ):
-                running_names = [
-                    futures_to_jobs[future].raster_list_path.name
-                    for future in pending_futures
-                ]
-                print(
-                    f"still running {len(pending_futures)} job(s) after "
-                    f"{now - start_time:.0f}s: {', '.join(running_names)}"
-                )
-                last_status_time = now
+                for future in done_futures:
+                    result = future.result()
+                    results.append(result)
+                    if overall_progress_bar is not None:
+                        overall_progress_bar.update(1)
+                    status = "ok" if result.returncode == 0 else "failed"
+                    status_message = (
+                        f"[{len(results)}/{len(jobs)}] {status}: "
+                        f"{result.job.raster_list_path.name} "
+                        f"({result.elapsed_seconds:.1f}s)"
+                    )
+                    if tqdm is not None:
+                        tqdm.write(status_message)
+                    else:
+                        print(status_message)
+                    if result.stdout:
+                        if tqdm is not None:
+                            tqdm.write(result.stdout.rstrip())
+                        else:
+                            print(result.stdout.rstrip())
+                    if result.stderr:
+                        if tqdm is not None:
+                            tqdm.write(result.stderr.rstrip(), file=sys.stderr)
+                        else:
+                            print(result.stderr.rstrip(), file=sys.stderr)
+
+                now = time.monotonic()
+                if (
+                    pending_futures
+                    and status_interval_seconds > 0
+                    and now - last_status_time >= status_interval_seconds
+                ):
+                    running_names = [
+                        futures_to_jobs[future].raster_list_path.name
+                        for future in pending_futures
+                    ]
+                    status_message = (
+                        f"still running {len(pending_futures)} job(s) after "
+                        f"{now - start_time:.0f}s: {', '.join(running_names)}"
+                    )
+                    if tqdm is not None:
+                        tqdm.write(status_message)
+                    else:
+                        print(status_message)
+                    last_status_time = now
+    finally:
+        if overall_progress_bar is not None:
+            overall_progress_bar.close()
 
     return results
 

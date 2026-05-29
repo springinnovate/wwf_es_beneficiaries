@@ -127,6 +127,34 @@ class HighPerformanceStitchRastersTests(unittest.TestCase):
 
             self.assertEqual(read_raster_list(list_path), [raster_path])
 
+    def test_reports_progress_events_and_compresses_output(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            raster_path = workspace_path / "a.tif"
+            output_path = workspace_path / "stitched.tif"
+            self._write_raster(
+                raster_path,
+                np.array([[1, 2], [3, 4]], dtype=np.int16),
+                0,
+                2,
+            )
+            progress_events = []
+
+            stitch_rasters(
+                [raster_path],
+                output_path,
+                progress_callback=progress_events.append,
+            )
+
+            with rasterio.open(output_path) as stitched:
+                self.assertEqual(stitched.profile["compress"], "lzw")
+
+            event_names = [event["event"] for event in progress_events]
+            self.assertIn("job_start", event_names)
+            self.assertIn("stage_start", event_names)
+            self.assertIn("progress", event_names)
+            self.assertIn("job_done", event_names)
+
 
 if __name__ == "__main__":
     unittest.main()
