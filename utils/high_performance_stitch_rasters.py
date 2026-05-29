@@ -90,7 +90,16 @@ def read_raster_list(list_path: Path) -> list[Path]:
 
 
 def _require_north_up(transform: Affine, raster_path: Path) -> None:
-    """Raise when a raster transform is rotated or south-up."""
+    """Validate that a raster transform is north-up.
+
+    Args:
+        transform: Raster affine transform to validate.
+        raster_path: Source raster path used in error messages.
+
+    Raises:
+        ValueError: If the transform is rotated, flipped, or otherwise not
+            north-up with positive x pixel size and negative y pixel size.
+    """
     if not math.isclose(transform.b, 0.0) or not math.isclose(transform.d, 0.0):
         raise ValueError(f"Rotated rasters are not supported: {raster_path}")
     if transform.a <= 0 or transform.e >= 0:
