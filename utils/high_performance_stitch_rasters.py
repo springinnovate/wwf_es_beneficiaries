@@ -243,7 +243,15 @@ def _iter_block_windows(
 
 
 def _valid_mask(data: np.ndarray, nodata) -> np.ndarray:
-    """Return a mask where ``data`` is not nodata."""
+    """Return a boolean mask for valid raster values.
+
+    Args:
+        data: Raster data array read from a source window.
+        nodata: Nodata value to exclude. ``None`` means every value is valid.
+
+    Returns:
+        Boolean array with ``True`` where ``data`` is not nodata.
+    """
     if nodata is None:
         return np.ones(data.shape, dtype=bool)
     if np.issubdtype(data.dtype, np.floating) and np.isnan(nodata):
