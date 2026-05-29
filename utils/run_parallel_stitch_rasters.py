@@ -137,11 +137,31 @@ def build_stitch_jobs(
     return jobs
 
 
+def _build_stitch_command(
+    job: StitchJob,
+    stitcher_script_path: Path,
+    python_executable: str,
+    nodata: str | None = None,
+) -> list[str]:
+    """Build the subprocess command for one stitch job."""
+    command = [
+        python_executable,
+        os.fspath(stitcher_script_path),
+        os.fspath(job.raster_list_path),
+        os.fspath(job.output_raster_path),
+        "--progress-json",
+    ]
+    if nodata is not None:
+        command.extend(["--nodata", nodata])
+    return command
+
+
 def run_stitch_job(
     job: StitchJob,
     stitcher_script_path: Path,
     python_executable: str,
     progress_position: int | None = None,
+    nodata: str | None = None,
 ) -> StitchResult:
     """Run one stitch job as a child Python process.
 
@@ -151,19 +171,19 @@ def run_stitch_job(
         python_executable: Python executable used to launch the stitcher.
         progress_position: Optional tqdm line position for this job's live
             progress bar.
+        nodata: Optional nodata override to pass to the stitcher.
 
     Returns:
         ``StitchResult`` with captured output and runtime.
     """
     start_time = time.monotonic()
     process = subprocess.Popen(
-        [
+        _build_stitch_command(
+            job,
+            stitcher_script_path,
             python_executable,
-            os.fspath(stitcher_script_path),
-            os.fspath(job.raster_list_path),
-            os.fspath(job.output_raster_path),
-            "--progress-json",
-        ],
+            nodata,
+        ),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -242,6 +262,7 @@ def run_stitch_jobs(
     stitcher_script_path: Path,
     python_executable: str,
     status_interval_seconds: int = DEFAULT_STATUS_INTERVAL_SECONDS,
+    nodata: str | None = None,
 ) -> list[StitchResult]:
     """Run stitch jobs in parallel with a worker limit.
 
@@ -252,6 +273,7 @@ def run_stitch_jobs(
         python_executable: Python executable used to launch each job.
         status_interval_seconds: Seconds between status messages while jobs
             are still running.
+        nodata: Optional nodata override to pass to each stitch job.
 
     Returns:
         Ordered list of completed ``StitchResult`` objects in completion order.
@@ -287,6 +309,7 @@ def run_stitch_jobs(
                 stitcher_script_path,
                 python_executable,
                 progress_position=position,
+                nodata=nodata,
             )
         finally:
             positions.put(position)
@@ -417,6 +440,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_STATUS_INTERVAL_SECONDS,
         help="Seconds between running-job status messages. Use 0 to disable.",
     )
+    parser.add_argument(
+        "--nodata",
+        default=None,
+        help=(
+            "Override nodata for each stitched output and ignore this value "
+            "in every input raster."
+        ),
+    )
     return parser
 
 
@@ -439,6 +470,7 @@ def main() -> None:
         args.stitcher_script.resolve(),
         args.python,
         args.status_interval,
+        args.nodata,
     )
     failed_results = [result for result in results if result.returncode != 0]
     if failed_results:

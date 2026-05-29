@@ -3,6 +3,8 @@ import unittest
 from pathlib import Path
 
 from utils.run_parallel_stitch_rasters import (
+    StitchJob,
+    _build_stitch_command,
     build_stitch_jobs,
     expand_raster_list_args,
 )
@@ -48,6 +50,21 @@ class RunParallelStitchRastersTests(unittest.TestCase):
                 jobs[0].output_raster_path,
                 (output_dir / "example_stitched.tif").resolve(),
             )
+
+    def test_build_stitch_command_passes_nodata_override(self):
+        job = StitchJob(
+            raster_list_path=Path("rasters.txt"),
+            output_raster_path=Path("stitched.tif"),
+        )
+
+        command = _build_stitch_command(
+            job,
+            Path("stitcher.py"),
+            "python",
+            nodata="0",
+        )
+
+        self.assertEqual(command[-2:], ["--nodata", "0"])
 
 
 if __name__ == "__main__":

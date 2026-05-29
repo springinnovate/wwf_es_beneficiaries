@@ -80,6 +80,19 @@ def _report_progress(
     progress_callback({"event": event, **payload})
 
 
+def _parse_nodata_value(value: str):
+    """Parse a CLI nodata value as int where possible, otherwise float."""
+    lowered_value = value.lower()
+    if any(char in lowered_value for char in ".e") or lowered_value in {
+        "nan",
+        "inf",
+        "+inf",
+        "-inf",
+    }:
+        return float(value)
+    return int(value)
+
+
 def read_raster_list(list_path: Path) -> list[Path]:
     """Read raster paths from ``list_path``.
 
@@ -154,6 +167,7 @@ def _require_north_up(transform: Affine, raster_path: Path) -> None:
 def _aligned_output_grid(
     raster_paths: Sequence[Path],
     progress_callback: ProgressCallback | None = None,
+    nodata_override=None,
 ) -> tuple[dict, tuple[float, float, float, float]]:
     """Build an output Rasterio profile from input rasters.
 
@@ -242,6 +256,8 @@ def _aligned_output_grid(
             "transform": from_origin(left, top, pixel_width, pixel_height),
         }
     )
+    if nodata_override is not None:
+        profile["nodata"] = nodata_override
     profile.update(DEFAULT_CREATION_OPTIONS)
     return profile, (left, bottom, right, top)
 
@@ -370,6 +386,7 @@ def stitch_rasters(
     raster_paths: Sequence[Path],
     output_path: Path,
     progress_callback: ProgressCallback | None = None,
+    nodata_override=None,
 ) -> Path:
     """Stitch ``raster_paths`` into ``output_path``.
 
@@ -380,6 +397,8 @@ def stitch_rasters(
         raster_paths: Ordered raster paths to stitch. The first raster defines
             the output grid metadata.
         output_path: GeoTIFF path to create.
+        nodata_override: Optional nodata value to set on the output raster and
+            treat as nodata in every input raster.
 
     Returns:
         Resolved output raster path.
@@ -401,7 +420,11 @@ def stitch_rasters(
         total_sources=len(raster_paths),
         output_path=str(output_path),
     )
-    output_profile, _ = _aligned_output_grid(raster_paths, progress_callback)
+    output_profile, _ = _aligned_output_grid(
+        raster_paths,
+        progress_callback,
+        nodata_override,
+    )
     output_nodata = output_profile.get("nodata")
 
     with rasterio.open(output_path, "w", **output_profile) as output:
@@ -463,14 +486,19 @@ def stitch_rasters(
                 }
                 if output_nodata is not None:
                     vrt_kwargs["nodata"] = output_nodata
-                if source.nodata is not None:
-                    vrt_kwargs["src_nodata"] = source.nodata
+                source_nodata = (
+                    nodata_override
+                    if nodata_override is not None
+                    else source.nodata
+                )
+                if source_nodata is not None:
+                    vrt_kwargs["src_nodata"] = source_nodata
 
                 with WarpedVRT(source, **vrt_kwargs) as source_vrt:
                     effective_nodata = (
                         source_vrt.nodata
                         if source_vrt.nodata is not None
-                        else source.nodata
+                        else source_nodata
                     )
                     for window in _iter_block_windows(
                         target_window,
@@ -528,6 +556,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Output GeoTIFF path.",
     )
     parser.add_argument(
+        "--nodata",
+        type=_parse_nodata_value,
+        default=None,
+        help=(
+            "Override nodata for the stitched output and ignore this value "
+            "in every input raster."
+        ),
+    )
+    parser.add_argument(
         "--progress-json",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -545,6 +582,7 @@ def main() -> None:
         raster_paths,
         args.output_raster,
         progress_callback=progress_callback,
+        nodata_override=args.nodata,
     )
     if not args.progress_json:
         print(f"Wrote {output_path}")

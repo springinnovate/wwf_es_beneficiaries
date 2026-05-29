@@ -32,6 +32,43 @@ class HighPerformanceStitchRastersTests(unittest.TestCase):
         with rasterio.open(path, "w", **profile) as target:
             target.write(array, 1)
 
+    def test_nodata_override_skips_values_without_source_nodata(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            raster_a_path = workspace_path / "a.tif"
+            raster_b_path = workspace_path / "b.tif"
+            output_path = workspace_path / "stitched.tif"
+
+            self._write_raster(
+                raster_a_path,
+                np.array([[1, 2], [0, 4]], dtype=np.int16),
+                0,
+                2,
+                nodata=None,
+            )
+            self._write_raster(
+                raster_b_path,
+                np.array([[0, 9], [10, 0]], dtype=np.int16),
+                0,
+                2,
+                nodata=None,
+            )
+
+            stitch_rasters(
+                [raster_a_path, raster_b_path],
+                output_path,
+                nodata_override=0,
+            )
+
+            with rasterio.open(output_path) as stitched:
+                result = stitched.read(1)
+                self.assertEqual(stitched.nodata, 0)
+
+            np.testing.assert_array_equal(
+                result,
+                np.array([[1, 9], [10, 4]], dtype=np.int16),
+            )
+
     def test_stitches_adjacent_rasters_and_skips_nodata(self):
         with tempfile.TemporaryDirectory() as workspace:
             workspace_path = Path(workspace)
