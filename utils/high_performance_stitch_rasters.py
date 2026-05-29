@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - tqdm is expected but not required.
 
 
 DEFAULT_BLOCK_SIZE = 256
+DEFAULT_IO_WINDOW_SIZE = DEFAULT_BLOCK_SIZE * 10
 DEFAULT_CREATION_OPTIONS = {
     "BIGTIFF": "YES",
     "NUM_THREADS": "ALL_CPUS",
@@ -350,7 +351,10 @@ def stitch_rasters(
                         if source_vrt.nodata is not None
                         else source.nodata
                     )
-                    for window in _iter_block_windows(target_window):
+                    for window in _iter_block_windows(
+                        target_window,
+                        DEFAULT_IO_WINDOW_SIZE,
+                    ):
                         data = source_vrt.read(window=window)
                         valid = _valid_mask(data, effective_nodata)
                         if not np.any(valid):
