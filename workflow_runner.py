@@ -1602,11 +1602,6 @@ def make_condition_mask_op(base_raster_nodata, expression):
     return _condition_mask_op
 
 
-def downstream_coverage_mask(mask):
-    """Return true where downstream coverage is meaningfully nonzero."""
-    return mask > DOWNSTREAM_COVERAGE_EPSILON
-
-
 def calculate_ds_pop_from_conditional_raster(
     aoi_vector_path,
     flow_dir_raster_path,
@@ -1734,7 +1729,7 @@ def calculate_ds_pop_from_conditional_raster(
         def _distance_mask_op(mask, n_pixels):
             return (
                 (n_pixels != DISTANCE_TRANSFORM_NODATA)
-                & downstream_coverage_mask(mask)
+                & (mask > DOWNSTREAM_COVERAGE_EPSILON)
                 & (n_pixels * travel_time_pixel_size_m <= max_downstream_distance_m)
             )
 
@@ -1766,7 +1761,11 @@ def calculate_ds_pop_from_conditional_raster(
     def mask_op(mask, pop_val):
         # mask values come from convolve so they can be veeeeeery close
         # to 0 without being 0 when the should be, so we just cap that here
-        return np.where(downstream_coverage_mask(mask) & (pop_val > 0), pop_val, 0)
+        return np.where(
+            (mask > DOWNSTREAM_COVERAGE_EPSILON) & (pop_val > 0),
+            pop_val,
+            0,
+        )
 
     pop_info = geoprocessing.get_raster_info(clipped_pop_raster_path)
     geoprocessing.raster_calculator(

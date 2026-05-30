@@ -37,7 +37,7 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
             ),
         )
 
-    def test_downstream_coverage_mask_ignores_tiny_convolution_noise(self):
+    def test_downstream_coverage_threshold_ignores_tiny_convolution_noise(self):
         mask = np.array(
             [
                 [0.0, np.finfo(float).eps],
@@ -46,7 +46,7 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
             dtype=np.float64,
         )
 
-        result = workflow_runner.downstream_coverage_mask(mask)
+        result = mask > workflow_runner.DOWNSTREAM_COVERAGE_EPSILON
 
         np.testing.assert_array_equal(
             result,
