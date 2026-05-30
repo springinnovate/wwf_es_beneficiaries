@@ -33,6 +33,27 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
             ),
         )
 
+    def test_downstream_coverage_mask_ignores_tiny_convolution_noise(self):
+        mask = np.array(
+            [
+                [0.0, np.finfo(float).eps],
+                [200 * np.finfo(float).eps, 1.0],
+            ],
+            dtype=np.float64,
+        )
+
+        result = workflow_runner.downstream_coverage_mask(mask)
+
+        np.testing.assert_array_equal(
+            result,
+            np.array(
+                [
+                    [False, False],
+                    [True, True],
+                ]
+            ),
+        )
+
     def test_bounds_mask_includes_wgs84_pixel_centers(self):
         mask = workflow_runner._rasterize_wgs84_bounds_mask(
             (-1.5, -0.5, 1.5, 1.5),

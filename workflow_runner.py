@@ -63,6 +63,7 @@ HEARTBEAT_INTERVAL_SECONDS = 60
 TRAVEL_TIME_MAX_DISTANCE_M_PER_HOUR = 104_000
 POPULATION_COMBINE_VRT_NODATA = -1
 DISTANCE_TRANSFORM_NODATA = -1
+DOWNSTREAM_COVERAGE_EPSILON = 100 * np.finfo(float).eps
 GTIFF_CREATION_OPTIONS = (
     "TILED=YES",
     "BIGTIFF=YES",
@@ -1596,6 +1597,11 @@ def condition_mask_op(value, base_raster_nodata, expression):
     return result
 
 
+def downstream_coverage_mask(mask):
+    """Return true where downstream coverage is meaningfully nonzero."""
+    return mask > DOWNSTREAM_COVERAGE_EPSILON
+
+
 def calculate_ds_pop_from_conditional_raster(
     aoi_vector_path,
     flow_dir_raster_path,
@@ -1726,7 +1732,7 @@ def calculate_ds_pop_from_conditional_raster(
         def _distance_mask_op(mask, n_pixels):
             return (
                 (n_pixels != DISTANCE_TRANSFORM_NODATA)
-                & mask.astype(bool)
+                & downstream_coverage_mask(mask)
                 & (n_pixels * travel_time_pixel_size_m <= max_downstream_distance_m)
             )
 
@@ -1758,7 +1764,7 @@ def calculate_ds_pop_from_conditional_raster(
     def mask_op(mask, pop_val):
         # mask values come from convolve so they can be veeeeeery close
         # to 0 without being 0 when the should be, so we just cap that here
-        return np.where((mask > 100 * np.finfo(float).eps) & (pop_val > 0), pop_val, 0)
+        return np.where(downstream_coverage_mask(mask) & (pop_val > 0), pop_val, 0)
 
     pop_info = geoprocessing.get_raster_info(clipped_pop_raster_path)
     geoprocessing.raster_calculator(
