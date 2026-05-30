@@ -1,5 +1,4 @@
 import unittest
-from pathlib import Path
 
 import numpy as np
 from pyproj import CRS, Transformer
@@ -11,30 +10,6 @@ import workflow_runner
 
 
 class Wgs84BoundsMaskTests(unittest.TestCase):
-
-    def test_conditional_partition_output_uses_section_output_for_single_partition(self):
-        section_output_path = Path("output") / "full_raster_extent_downstream_pop.tif"
-
-        result = workflow_runner.conditional_partition_pop_raster_path(
-            1,
-            section_output_path,
-            Path("work") / "full_raster_extent" / "drain_1",
-            "downstream",
-        )
-
-        self.assertEqual(result, section_output_path)
-
-    def test_conditional_partition_output_uses_workspace_for_multi_partition(self):
-        partition_working_dir = Path("work") / "full_raster_extent" / "drain_1"
-
-        result = workflow_runner.conditional_partition_pop_raster_path(
-            2,
-            Path("output") / "full_raster_extent_downstream_pop.tif",
-            partition_working_dir,
-            "downstream",
-        )
-
-        self.assertEqual(result, partition_working_dir / "downstream_pop.tif")
 
     def test_condition_mask_treats_source_nodata_as_false(self):
         value = np.array(

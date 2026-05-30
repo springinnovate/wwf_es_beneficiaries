@@ -2170,23 +2170,6 @@ def calculate_taskgraph_worker_count(config: dict, work_unit_count: int) -> int:
     return min(desired_worker_count, physical_cpu_count)
 
 
-def conditional_partition_pop_raster_path(
-    partition_context_count: int,
-    section_pop_raster_path: Path,
-    partition_working_dir: Path,
-    section_id: str,
-) -> Path:
-    """Return the output path for one conditional partition population raster.
-
-    When there is only one partition, the partition output is also the final
-    section output. When multiple partitions are present, each partition raster
-    is an intermediate and belongs in that partition's workspace.
-    """
-    if partition_context_count == 1:
-        return section_pop_raster_path
-    return partition_working_dir / f"{section_id}_pop.tif"
-
-
 def main() -> None:
     """Entry point."""
     ap = argparse.ArgumentParser(
@@ -2372,12 +2355,12 @@ def main() -> None:
                     partition_id,
                     partition_context,
                 ) in partition_contexts.items():
-                    partition_pop_raster_path = conditional_partition_pop_raster_path(
-                        len(partition_contexts),
-                        target_pop_raster_path,
-                        partition_context["working_dir"],
-                        section_id,
-                    )
+                    if len(partition_contexts) == 1:
+                        partition_pop_raster_path = target_pop_raster_path
+                    else:
+                        partition_pop_raster_path = (
+                            partition_context["working_dir"] / f"{section_id}_pop.tif"
+                        )
                     partition_pop_id_raster_list.append(
                         (partition_id, partition_pop_raster_path)
                     )
