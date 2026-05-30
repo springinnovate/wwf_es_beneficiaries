@@ -11,6 +11,53 @@ import workflow_runner
 
 class Wgs84BoundsMaskTests(unittest.TestCase):
 
+    def test_condition_mask_treats_source_nodata_as_false(self):
+        value = np.array(
+            [
+                [5, -9999],
+                [0, 7],
+            ],
+            dtype=np.int16,
+        )
+
+        condition_mask_op = workflow_runner.make_condition_mask_op(
+            -9999,
+            "value > 0",
+        )
+        result = condition_mask_op(value)
+
+        np.testing.assert_array_equal(
+            result,
+            np.array(
+                [
+                    [1, 0],
+                    [0, 1],
+                ],
+                dtype=np.uint8,
+            ),
+        )
+
+    def test_downstream_coverage_threshold_ignores_tiny_convolution_noise(self):
+        mask = np.array(
+            [
+                [0.0, np.finfo(float).eps],
+                [200 * np.finfo(float).eps, 1.0],
+            ],
+            dtype=np.float64,
+        )
+
+        result = mask > workflow_runner.DOWNSTREAM_COVERAGE_EPSILON
+
+        np.testing.assert_array_equal(
+            result,
+            np.array(
+                [
+                    [False, False],
+                    [True, True],
+                ]
+            ),
+        )
+
     def test_bounds_mask_includes_wgs84_pixel_centers(self):
         mask = workflow_runner._rasterize_wgs84_bounds_mask(
             (-1.5, -0.5, 1.5, 1.5),
