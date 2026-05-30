@@ -20,7 +20,11 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
             dtype=np.int16,
         )
 
-        result = workflow_runner.condition_mask_op(value, -9999, "value > 0")
+        condition_mask_op = workflow_runner.make_condition_mask_op(
+            -9999,
+            "value > 0",
+        )
+        result = condition_mask_op(value)
 
         np.testing.assert_array_equal(
             result,

@@ -1573,28 +1573,33 @@ def create_distance_transform(
     base_raster = None
 
 
-def condition_mask_op(value, base_raster_nodata, expression):
-    """Evaluate a conditional raster expression into a binary mask.
+def make_condition_mask_op(base_raster_nodata, expression):
+    """Build a raster calculator op for a binary condition mask.
 
-    Source nodata pixels are always false. This keeps nodata values from
-    leaking into the downstream source mask as nonzero byte values.
+    The returned function evaluates ``expression`` only on valid source pixels.
+    Source nodata pixels are always false so they cannot leak into the
+    downstream source mask as nonzero byte values.
     """
-    result = np.zeros(value.shape, dtype=np.uint8)
-    valid_mask = (
-        np.ones(value.shape, dtype=bool)
-        if base_raster_nodata is None
-        else value != base_raster_nodata
-    )
-    if not np.any(valid_mask):
+
+    def _condition_mask_op(value):
+        result = np.zeros(value.shape, dtype=np.uint8)
+        valid_mask = (
+            np.ones(value.shape, dtype=bool)
+            if base_raster_nodata is None
+            else value != base_raster_nodata
+        )
+        if not np.any(valid_mask):
+            return result
+
+        expression_result = eval(
+            expression,
+            {"__builtins__": {}},
+            {"value": value[valid_mask], "np": np},
+        )
+        result[valid_mask] = np.asarray(expression_result).astype(bool).astype(np.uint8)
         return result
 
-    expression_result = eval(
-        expression,
-        {"__builtins__": {}},
-        {"value": value[valid_mask], "np": np},
-    )
-    result[valid_mask] = np.asarray(expression_result).astype(bool).astype(np.uint8)
-    return result
+    return _condition_mask_op
 
 
 def downstream_coverage_mask(mask):
@@ -1687,12 +1692,9 @@ def calculate_ds_pop_from_conditional_raster(
 
     base_raster_nodata = base_info["nodata"][0]
 
-    def _local_op(value):
-        return condition_mask_op(value, base_raster_nodata, expression)
-
     geoprocessing.raster_calculator(
         [(str(clipped_base_raster_path), 1)],
-        _local_op,
+        make_condition_mask_op(base_raster_nodata, expression),
         condition_raster_path,
         gdal.GDT_Byte,
         0,
