@@ -2359,8 +2359,7 @@ def main() -> None:
                         partition_pop_raster_path = target_pop_raster_path
                     else:
                         partition_pop_raster_path = (
-                            output_dir
-                            / f"{aoi_key}_{partition_id}_{section_id}_pop.tif"
+                            partition_context["working_dir"] / f"{section_id}_pop.tif"
                         )
                     partition_pop_id_raster_list.append(
                         (partition_id, partition_pop_raster_path)
