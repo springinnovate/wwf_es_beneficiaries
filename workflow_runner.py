@@ -2079,7 +2079,23 @@ def mask_population_with_coverage(
     coverage_raster_path,
     target_population_raster_path,
 ):
-    """Mask global population by a stitched coverage raster."""
+    """Mask global population values by a stitched coverage raster.
+
+    The coverage raster defines the target grid for the output. Population is
+    read through a WarpedVRT on that grid, with nodata and negative values
+    treated as 0. Pixels where coverage is 0 are written as 0, and pixels where
+    coverage is positive retain their population value.
+
+    Args:
+        population_raster_path: Path-like global population raster to mask.
+        coverage_raster_path: Path-like binary coverage raster where values
+            greater than 0 indicate covered pixels.
+        target_population_raster_path: Path-like output raster where masked
+            population values will be written.
+
+    Returns:
+        Sum of the output masked population raster.
+    """
     logger = logging.getLogger(__name__)
     target_population_raster_path = Path(target_population_raster_path)
     target_population_raster_path.parent.mkdir(parents=True, exist_ok=True)
