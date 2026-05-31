@@ -1288,6 +1288,16 @@ def eck4_limits(r=6371000):
 ECKERT_IV_MAX_X, ECKERT_IV_MAX_Y = eck4_limits()  # ≈ 15 110 000 , 7 540 000
 
 
+def _is_eckert_iv_crs(crs):
+    """Return True when ``crs`` uses an Eckert IV projection."""
+    if crs is None:
+        return False
+    coordinate_operation = CRS.from_user_input(crs).coordinate_operation
+    if coordinate_operation is None:
+        return False
+    return coordinate_operation.method_name == "Eckert IV"
+
+
 def _clamp_eckert_point(x, y):
     r2 = (x * x) / (ECKERT_IV_MAX_X * ECKERT_IV_MAX_X) + (y * y) / (
         ECKERT_IV_MAX_Y * ECKERT_IV_MAX_Y
@@ -1301,7 +1311,7 @@ def _clamp_eckert_point(x, y):
 def transform_edge_points_eckert_to_wgs84(bbox_gdf, dst_crs="EPSG:4326"):
     if bbox_gdf.crs is None:
         raise ValueError("bbox_gdf must have a CRS defined")
-    if "+proj=eck4" not in bbox_gdf.crs.to_proj4().lower():
+    if not _is_eckert_iv_crs(bbox_gdf.crs):
         return bbox_gdf.to_crs(dst_crs)
 
     minx, miny, maxx, maxy = bbox_gdf.total_bounds
@@ -1323,7 +1333,7 @@ def _clip_and_reproject_raster(
         if bbox_gdf.crs is None:
             raise ValueError("bbox_gdf must have a CRS defined")
 
-        if "+proj=eck4" in bbox_gdf.crs.to_proj4().lower():
+        if _is_eckert_iv_crs(bbox_gdf.crs):
             # eckert is so broken, just doing regular lat/lng bounds
             projected_box_gdf = gpd.GeoDataFrame(
                 geometry=[box(-179, -80, 179, 80)], crs="EPSG:4326"
@@ -1479,7 +1489,13 @@ def calculate_travel_time_coverage(
         n_rows, n_cols = friction_array.shape
 
     travel_reach_array = shortest_distances.find_mask_reach(
-        friction_array, mask_array, cell_length_m, n_cols, n_rows, max_time_mins
+        friction_array,
+        mask_array,
+        cell_length_m,
+        n_cols,
+        n_rows,
+        max_time_mins,
+        progress_interval_seconds=0,
     )
 
     with rasterio.open(target_coverage_raster_path, "w", **aoi_meta) as max_reach:

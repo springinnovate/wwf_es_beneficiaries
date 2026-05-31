@@ -1,4 +1,5 @@
 import unittest
+import warnings
 from pathlib import Path
 import tempfile
 
@@ -13,6 +14,19 @@ import workflow_runner
 
 
 class Wgs84BoundsMaskTests(unittest.TestCase):
+
+    def test_is_eckert_iv_crs_detects_projection_without_proj4_warning(self):
+        eckert_crs = CRS.from_proj4("+proj=eck4 +R=6371000 +units=m +no_defs")
+
+        with warnings.catch_warnings(record=True) as captured_warnings:
+            warnings.simplefilter("always")
+            self.assertTrue(workflow_runner._is_eckert_iv_crs(eckert_crs))
+
+        self.assertFalse(workflow_runner._is_eckert_iv_crs("EPSG:4326"))
+        warning_messages = [str(warning.message) for warning in captured_warnings]
+        self.assertFalse(
+            any("lose important projection information" in msg for msg in warning_messages)
+        )
 
     def test_condition_mask_treats_source_nodata_as_false(self):
         value = np.array(
