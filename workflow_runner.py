@@ -1222,20 +1222,39 @@ def align_and_resize_raster_stack_on_vector(
     target_pixel_size,
     bounding_vector_path,
 ):
+    list_lengths = {
+        len(raster_path_list),
+        len(target_path_list),
+        len(resample_method_list),
+    }
+    if len(list_lengths) != 1:
+        raise ValueError(
+            "raster_path_list, target_path_list, and resample_method_list "
+            "must have the same length"
+        )
+
     gdf = gpd.read_file(bounding_vector_path)
     gdf = gdf.set_geometry(gdf.geometry.make_valid())
     if not gdf.crs or gdf.crs.to_string() != "EPSG:4326":
         gdf = gdf.to_crs("EPSG:4326")
 
-    # minx, miny, maxx, maxy = gdf.total_bounds
-    geoprocessing.align_and_resize_raster_stack(
+    target_bb = [float(x) for x in gdf.total_bounds]
+    target_projection_wkt = CRS.from_user_input(gdf.crs).to_wkt()
+    for raster_path, target_path, resample_method in zip(
         raster_path_list,
         target_path_list,
         resample_method_list,
-        target_pixel_size,
-        [float(x) for x in gdf.total_bounds],
-        raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
-    )
+    ):
+        geoprocessing.warp_raster(
+            raster_path,
+            target_pixel_size,
+            target_path,
+            resample_method,
+            target_bb=target_bb,
+            target_projection_wkt=target_projection_wkt,
+            working_dir=Path(target_path).parent,
+            raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
+        )
     for target_path in target_path_list:
         mask_raster_to_vector(target_path, bounding_vector_path)
 
@@ -2428,6 +2447,7 @@ def main() -> None:
         )
         pop_results[aoi_key][combined_header] = combined_task
 
+    task_graph.close()
     task_graph.join()
     rows = []
     for aoi_key, results in pop_results.items():
@@ -2449,7 +2469,6 @@ def main() -> None:
         / f'{config["run_name"]}_{datetime.now().strftime("%Y_%m_%d_%H_%M_%S")}.csv'
     )
     df.to_csv(csv_path, index=False)
-    task_graph.close()
 
 
 if __name__ == "__main__":
