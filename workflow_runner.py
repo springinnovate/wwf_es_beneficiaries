@@ -1215,10 +1215,10 @@ def partition_subwatersheds_by_terminal_drain(
     return partition_paths
 
 
-def align_and_resize_raster_stack_on_vector(
-    raster_path_list,
-    target_path_list,
-    resample_method_list,
+def align_and_resize_raster_on_vector(
+    raster_path,
+    target_path,
+    resample_method,
     target_pixel_size,
     bounding_vector_path,
 ):
@@ -1227,17 +1227,19 @@ def align_and_resize_raster_stack_on_vector(
     if not gdf.crs or gdf.crs.to_string() != "EPSG:4326":
         gdf = gdf.to_crs("EPSG:4326")
 
-    # minx, miny, maxx, maxy = gdf.total_bounds
-    geoprocessing.align_and_resize_raster_stack(
-        raster_path_list,
-        target_path_list,
-        resample_method_list,
+    target_bb = [float(x) for x in gdf.total_bounds]
+    target_projection_wkt = CRS.from_user_input(gdf.crs).to_wkt()
+    geoprocessing.warp_raster(
+        raster_path,
         target_pixel_size,
-        [float(x) for x in gdf.total_bounds],
+        target_path,
+        resample_method,
+        target_bb=target_bb,
+        target_projection_wkt=target_projection_wkt,
+        working_dir=Path(target_path).parent,
         raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
     )
-    for target_path in target_path_list:
-        mask_raster_to_vector(target_path, bounding_vector_path)
+    mask_raster_to_vector(target_path, bounding_vector_path)
 
 
 def mask_raster_to_vector(raster_path: str | Path, vector_path: str | Path) -> None:
@@ -2281,17 +2283,29 @@ def main() -> None:
                 clipped_pop_raster_path = target_clipped_raster_path_list[0]
                 clipped_dem_path = target_clipped_raster_path_list[1]
 
-                clip_task = task_graph.add_task(
-                    func=align_and_resize_raster_stack_on_vector,
+                pop_clip_task = task_graph.add_task(
+                    func=align_and_resize_raster_on_vector,
                     args=(
-                        base_raster_path_list,
-                        target_clipped_raster_path_list,
-                        ["near"] * len(base_raster_path_list),
+                        base_raster_path_list[0],
+                        clipped_pop_raster_path,
+                        "near",
                         [wgs84_pixel_size, -wgs84_pixel_size],
                         partition_vector_path,
                     ),
-                    target_path_list=target_clipped_raster_path_list,
-                    task_name=f"clip base data for {aoi_key} {partition_id}",
+                    target_path_list=[clipped_pop_raster_path],
+                    task_name=f"clip population for {aoi_key} {partition_id}",
+                )
+                dem_clip_task = task_graph.add_task(
+                    func=align_and_resize_raster_on_vector,
+                    args=(
+                        base_raster_path_list[1],
+                        clipped_dem_path,
+                        "near",
+                        [wgs84_pixel_size, -wgs84_pixel_size],
+                        partition_vector_path,
+                    ),
+                    target_path_list=[clipped_dem_path],
+                    task_name=f"clip DEM for {aoi_key} {partition_id}",
                 )
                 dem_path_root, dem_path_ext = os.path.splitext(str(clipped_dem_path))
                 target_flow_dir_raster_path = f"{dem_path_root}_mfdflow{dem_path_ext}"
@@ -2302,7 +2316,7 @@ def main() -> None:
                         partition_working_dir,
                         target_flow_dir_raster_path,
                     ),
-                    dependent_task_list=[clip_task],
+                    dependent_task_list=[dem_clip_task],
                     target_path_list=[target_flow_dir_raster_path],
                     task_name=f"calculate flow dir for {aoi_key} {partition_id}",
                 )
@@ -2310,6 +2324,7 @@ def main() -> None:
                     "clipped_pop_raster_path": Path(clipped_pop_raster_path),
                     "flow_dir_raster_path": Path(target_flow_dir_raster_path),
                     "flow_dir_task": flow_dir_task,
+                    "pop_clip_task": pop_clip_task,
                     "working_dir": partition_working_dir,
                 }
             if not partition_contexts:
@@ -2382,7 +2397,10 @@ def main() -> None:
                             partition_context["working_dir"],
                             partition_pop_raster_path,
                         ),
-                        dependent_task_list=[partition_context["flow_dir_task"]],
+                        dependent_task_list=[
+                            partition_context["flow_dir_task"],
+                            partition_context["pop_clip_task"],
+                        ],
                         store_result=True,
                         target_path_list=[partition_pop_raster_path],
                         task_name=(
@@ -2428,6 +2446,7 @@ def main() -> None:
         )
         pop_results[aoi_key][combined_header] = combined_task
 
+    task_graph.close()
     task_graph.join()
     rows = []
     for aoi_key, results in pop_results.items():
@@ -2449,7 +2468,6 @@ def main() -> None:
         / f'{config["run_name"]}_{datetime.now().strftime("%Y_%m_%d_%H_%M_%S")}.csv'
     )
     df.to_csv(csv_path, index=False)
-    task_graph.close()
 
 
 if __name__ == "__main__":
