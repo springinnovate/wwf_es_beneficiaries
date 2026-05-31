@@ -1383,18 +1383,16 @@ def _clip_and_reproject_raster(
             )
 
 
-def apply_travel_time_mask(
+def calculate_travel_time_coverage(
     traveltime_raster_path: Path,
-    population_raster_path: Path,
     aoi_vector_path: Path,
     max_hours: float,
     target_crs: str,
-    target_pop_raster_path: Path,
+    target_coverage_raster_path: Path,
     working_dir: Path,
     use_wgs84_bounds_mask: bool = False,
 ):
-    """
-    Create a travel-time mask clipped to an AOI.
+    """Create a binary travel-time coverage raster clipped to an AOI.
 
     Args:
         traveltime_raster_path (str | Path): Path to a raster where each pixel
@@ -1408,11 +1406,12 @@ def apply_travel_time_mask(
             local projected CRS can collapse the rasterized mask.
 
     Returns:
-        rasterio.io.DatasetReader: An in-memory raster mask where pixels within
-        the AOI and <= max_hours are valid (1), and others are nodata (0).
+        Path: ``target_coverage_raster_path``.
     """
     logger = logging.getLogger(__name__)
     max_time_mins = max_hours * 60
+    working_dir = Path(working_dir)
+    working_dir.mkdir(parents=True, exist_ok=True)
 
     aoi_vector = gpd.read_file(aoi_vector_path)
     aoi_wgs84_bounds = aoi_vector.to_crs("EPSG:4326").total_bounds
@@ -1432,31 +1431,20 @@ def apply_travel_time_mask(
     logger.debug(f"buffered box: {buffered_bbox}")
     bbox_gdf = gpd.GeoDataFrame({"geometry": [buffered_bbox]}, crs=projected_gdf.crs)
 
-    target_pop_clipped_raster_path = Path(
-        working_dir / f"{traveltime_raster_path.stem}_travel_clip.tif"
-    )
     target_friction_clipped_raster_path = Path(
         working_dir / f"{traveltime_raster_path.stem}_friction_clip.tif"
     )
     target_aoi_raster_path = Path(working_dir / "travel_time_aoi_mask.tif")
 
     _clip_and_reproject_raster(
-        population_raster_path,
-        bbox_gdf,
-        projected_gdf.crs,
-        target_pop_clipped_raster_path,
-    )
-
-    with rasterio.open(target_pop_clipped_raster_path) as pop_ref:
-        ref_meta = pop_ref.meta.copy()
-
-    _clip_and_reproject_raster(
         traveltime_raster_path,
         bbox_gdf,
         projected_gdf.crs,
         target_friction_clipped_raster_path,
-        reference_meta=ref_meta,
     )
+
+    with rasterio.open(target_friction_clipped_raster_path) as friction_ref:
+        ref_meta = friction_ref.meta.copy()
 
     if use_wgs84_bounds_mask:
         mask_array = _rasterize_wgs84_bounds_mask(
@@ -1494,30 +1482,11 @@ def apply_travel_time_mask(
         friction_array, mask_array, cell_length_m, n_cols, n_rows, max_time_mins
     )
 
-    target_max_reach_raster_path = working_dir / f"max_reach_{max_time_mins}min.tif"
-
-    with rasterio.open(target_max_reach_raster_path, "w", **aoi_meta) as max_reach:
+    with rasterio.open(target_coverage_raster_path, "w", **aoi_meta) as max_reach:
         max_reach.write(travel_reach_array, 1)
 
     travel_reach_array = None
-
-    def mask_op(mask, pop_val):
-        return np.where((mask > 0) & (pop_val > 0), pop_val, 0)
-
-    geoprocessing.raster_calculator(
-        [
-            (str(target_max_reach_raster_path), 1),
-            (str(target_pop_clipped_raster_path), 1),
-        ],
-        mask_op,
-        target_pop_raster_path,
-        gdal.GDT_Int32,
-        0,
-        largest_block=10 * 2**20,
-        calc_raster_stats=False,
-        raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
-    )
-    return _sum_raster_blocks(target_pop_raster_path)
+    return target_coverage_raster_path
 
 
 def create_distance_transform(
@@ -1604,10 +1573,9 @@ def make_condition_mask_op(base_raster_nodata, expression):
     return _condition_mask_op
 
 
-def calculate_ds_pop_from_conditional_raster(
+def calculate_downstream_coverage_from_conditional_raster(
     aoi_vector_path,
     flow_dir_raster_path,
-    clipped_pop_raster_path,
     base_raster_path,
     condition_id,
     expression,
@@ -1615,16 +1583,15 @@ def calculate_ds_pop_from_conditional_raster(
     max_downstream_distance_m,
     travel_time_pixel_size_m,
     working_dir,
-    target_pop_raster_path,
+    target_coverage_raster_path,
 ):
-    """Calculate downstream population satisfying a conditional raster expression.
+    """Calculate downstream coverage satisfying a conditional raster expression.
 
     This function evaluates a user-provided expression on a base raster to
     create a binary condition mask, routes that mask downstream using
-    multiple-flow-direction accumulation, optionally buffers and truncates it
-    by a maximum downstream distance, and then applies the resulting coverage
-    mask to a population raster. The masked population raster is written to
-    disk and its total population is returned.
+    multiple-flow-direction accumulation, buffers it, and optionally truncates
+    it by a maximum downstream distance. The final output is a binary coverage
+    raster.
 
     Intermediate rasters (condition mask, clipped base, downstream coverage,
     buffer kernel, distance transform, and optionally distance-limited
@@ -1636,8 +1603,6 @@ def calculate_ds_pop_from_conditional_raster(
             area of interest. Used to mask the warped base raster.
         flow_dir_raster_path: Path-like to a flow-direction raster used as
             input to ``routing.flow_accumulation_mfd``.
-        clipped_pop_raster_path: Path-like to a population raster already
-            aligned and clipped to the flow-direction grid.
         base_raster_path: Path-like to the base raster on which
             ``expression`` is evaluated to derive the condition mask.
         condition_id: Identifier (string or value convertible to string) used
@@ -1655,12 +1620,11 @@ def calculate_ds_pop_from_conditional_raster(
             ``max_downstream_distance_m``.
         working_dir: Path-like directory where all intermediate rasters and
             kernels will be written.
-        target_pop_raster_path: Path-like where the final masked population
+        target_coverage_raster_path: Path-like where the final binary coverage
             raster will be written.
 
     Returns:
-        float: Sum of the population values in ``target_pop_raster_path``
-        after applying the downstream coverage and optional distance limit.
+        Path: ``target_coverage_raster_path``.
     """
     logger = logging.getLogger(__name__)
     logger.debug(f"max downstream distance: {max_downstream_distance_m}")
@@ -1760,29 +1724,21 @@ def calculate_ds_pop_from_conditional_raster(
         )
         buffered_ds_coverage_raster_path = maxdist_buffered_ds_coverage_raster_path
 
-    def mask_op(mask, pop_val):
+    def coverage_mask_op(mask):
         # mask values come from convolve so they can be veeeeeery close
         # to 0 without being 0 when the should be, so we just cap that here
-        return np.where(
-            (mask > DOWNSTREAM_COVERAGE_EPSILON) & (pop_val > 0),
-            pop_val,
-            0,
-        )
+        return (mask > DOWNSTREAM_COVERAGE_EPSILON).astype(np.uint8)
 
-    pop_info = geoprocessing.get_raster_info(clipped_pop_raster_path)
     geoprocessing.raster_calculator(
-        [
-            (str(buffered_ds_coverage_raster_path), 1),
-            (str(clipped_pop_raster_path), 1),
-        ],
-        mask_op,
-        target_pop_raster_path,
-        pop_info["datatype"],
-        None,
+        [(str(buffered_ds_coverage_raster_path), 1)],
+        coverage_mask_op,
+        target_coverage_raster_path,
+        gdal.GDT_Byte,
+        0,
         calc_raster_stats=False,
         raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
     )
-    return np.sum(gdal.OpenEx(target_pop_raster_path).ReadAsArray())
+    return target_coverage_raster_path
 
 
 def calc_flow_dir(dem_path, working_dir, target_flow_dir_raster_path):
@@ -1828,6 +1784,8 @@ def _raster_bounds_in_crs(raster: rasterio.DatasetReader, target_crs) -> tuple:
 def _combined_raster_profile(
     raster_path_list: list[str],
     wgs84_pixel_size: float,
+    dtype: str = "float32",
+    nodata=None,
 ) -> dict:
     """Build a tiled WGS84 Rasterio profile covering all input rasters.
 
@@ -1836,10 +1794,12 @@ def _combined_raster_profile(
             output extent.
         wgs84_pixel_size: Output pixel size in WGS84 degrees. The absolute
             value is used so callers may pass a signed pixel size.
+        dtype: Rasterio dtype for the output profile.
+        nodata: Nodata value for the output profile.
 
     Returns:
-        Rasterio profile for a single-band, float32, 256 x 256 tiled GeoTIFF
-        in EPSG:4326.
+        Rasterio profile for a single-band, 256 x 256 tiled GeoTIFF in
+        EPSG:4326.
 
     Raises:
         ValueError: If ``wgs84_pixel_size`` is not positive, no finite raster
@@ -1882,10 +1842,10 @@ def _combined_raster_profile(
         "height": height,
         "width": width,
         "count": 1,
-        "dtype": "float32",
+        "dtype": dtype,
         "crs": target_crs,
         "transform": from_origin(minx, maxy, pixel_size, pixel_size),
-        "nodata": None,
+        "nodata": nodata,
     }
     _set_tiled_geotiff_creation_options(profile)
     return profile
@@ -2006,83 +1966,69 @@ def _create_zeroed_raster(target_path: Path, profile: dict) -> None:
             )
 
 
-def combine_pops(
-    pop_id_raster_list,
+def stitch_coverage_masks(
+    coverage_id_raster_list,
     wgs84_pixel_size,
     working_dir,
-    target_combined_pop_raster_path,
+    target_coverage_raster_path,
 ):
+    """Stitch binary coverage rasters into one global binary coverage raster."""
     logger = logging.getLogger(__name__)
 
-    raster_count = len(pop_id_raster_list)
+    raster_count = len(coverage_id_raster_list)
     if raster_count == 0:
-        raise ValueError("No population rasters were provided for combine.")
+        raise ValueError("No coverage rasters were provided for stitching.")
 
     logger.info(
-        "combining %d population rasters into %s",
+        "stitching %d coverage rasters into %s",
         raster_count,
-        target_combined_pop_raster_path,
+        target_coverage_raster_path,
     )
 
-    raster_ids = [raster_id for raster_id, _ in pop_id_raster_list]
-    base_pop_raster_list = [str(path) for _, path in pop_id_raster_list]
-    target_combined_pop_raster_path = Path(target_combined_pop_raster_path)
-    target_profile = _combined_raster_profile(base_pop_raster_list, wgs84_pixel_size)
-
-    logger.info(
-        "initializing combined population raster %s: %dx%d px, "
-        "%dx%d blocks, block size=%dx%d",
-        target_combined_pop_raster_path,
-        target_profile["width"],
-        target_profile["height"],
-        math.ceil(target_profile["width"] / RASTER_BLOCK_SIZE),
-        math.ceil(target_profile["height"] / RASTER_BLOCK_SIZE),
-        RASTER_BLOCK_SIZE,
-        RASTER_BLOCK_SIZE,
+    coverage_ids = [coverage_id for coverage_id, _ in coverage_id_raster_list]
+    coverage_raster_list = [str(path) for _, path in coverage_id_raster_list]
+    target_coverage_raster_path = Path(target_coverage_raster_path)
+    target_profile = _combined_raster_profile(
+        coverage_raster_list,
+        wgs84_pixel_size,
+        dtype="uint8",
+        nodata=0,
     )
-    with _log_heartbeat(
-        logger,
-        lambda: f"initializing combined population raster {target_combined_pop_raster_path}",
-    ):
-        _create_zeroed_raster(target_combined_pop_raster_path, target_profile)
 
-    combine_state = {
+    _create_zeroed_raster(target_coverage_raster_path, target_profile)
+
+    stitch_state = {
         "index": 0,
         "raster_id": "",
         "pixels": 0,
     }
-    pop_sums_by_id = {}
+    coverage_counts_by_id = {}
 
-    logger.info(
-        "streaming %d population rasters into %s",
-        raster_count,
-        target_combined_pop_raster_path,
-    )
     with _log_heartbeat(
         logger,
         lambda: (
-            "streaming population rasters: "
-            f"{combine_state['index']}/{raster_count} rasters, "
-            f"current={combine_state['raster_id']}, "
-            f"{combine_state['pixels']} target pixels visited"
+            "stitching coverage rasters: "
+            f"{stitch_state['index']}/{raster_count} rasters, "
+            f"current={stitch_state['raster_id']}, "
+            f"{stitch_state['pixels']} target pixels visited"
         ),
     ):
-        with rasterio.open(target_combined_pop_raster_path, "r+") as target:
+        with rasterio.open(target_coverage_raster_path, "r+") as target:
             target_crs = target.crs
             target_transform = target.transform
             with tqdm(
-                zip(raster_ids, base_pop_raster_list),
+                zip(coverage_ids, coverage_raster_list),
                 total=raster_count,
-                desc="combine population rasters",
+                desc="stitch coverage rasters",
                 unit="raster",
             ) as progress:
-                for raster_index, (raster_id, source_path) in enumerate(
+                for raster_index, (coverage_id, source_path) in enumerate(
                     progress,
                     start=1,
                 ):
-                    combine_state["index"] = raster_index - 1
-                    combine_state["raster_id"] = str(raster_id)
-                    source_sum = np.float64(0)
+                    stitch_state["index"] = raster_index - 1
+                    stitch_state["raster_id"] = str(coverage_id)
+                    source_count = np.float64(0)
                     with rasterio.open(source_path) as source:
                         source_bounds = _raster_bounds_in_crs(source, target_crs)
                         target_window = _integer_window(
@@ -2091,7 +2037,7 @@ def combine_pops(
                             target.height,
                         )
                         if target_window.width == 0 or target_window.height == 0:
-                            pop_sums_by_id[raster_id] = source_sum
+                            coverage_counts_by_id[coverage_id] = source_count
                             continue
 
                         vrt_kwargs = {
@@ -2100,51 +2046,117 @@ def combine_pops(
                             "width": target.width,
                             "height": target.height,
                             "resampling": Resampling.nearest,
-                            "nodata": POPULATION_COMBINE_VRT_NODATA,
+                            "nodata": 0,
                         }
                         if source.nodata is not None:
                             vrt_kwargs["src_nodata"] = source.nodata
 
                         with WarpedVRT(source, **vrt_kwargs) as source_vrt:
                             for window in _iter_block_windows(target_window):
-                                incoming = source_vrt.read(
-                                    1,
-                                    window=window,
-                                ).astype(np.float32, copy=False)
-                                incoming[incoming < 0] = 0
-                                combine_state["pixels"] += int(
+                                incoming = source_vrt.read(1, window=window)
+                                incoming = (incoming > 0).astype(np.uint8)
+                                stitch_state["pixels"] += int(
                                     window.width * window.height
                                 )
-                                source_sum += np.sum(incoming, dtype=np.float64)
+                                source_count += np.sum(incoming, dtype=np.float64)
                                 if not np.any(incoming):
                                     continue
                                 existing = target.read(1, window=window)
                                 np.maximum(existing, incoming, out=existing)
                                 target.write(existing, 1, window=window)
 
-                    pop_sums_by_id[raster_id] = source_sum
-                    combine_state["index"] = raster_index
-                    progress.set_postfix_str(str(raster_id))
+                    coverage_counts_by_id[coverage_id] = source_count
+                    stitch_state["index"] = raster_index
+                    progress.set_postfix_str(str(coverage_id))
 
-    logger.info("wrote combined population raster %s", target_combined_pop_raster_path)
+    coverage_counts_by_id["coverage"] = _sum_raster_blocks(target_coverage_raster_path)
+    logger.info("wrote coverage raster %s", target_coverage_raster_path)
+    return coverage_counts_by_id
+
+
+def mask_population_with_coverage(
+    population_raster_path,
+    coverage_raster_path,
+    target_population_raster_path,
+):
+    """Mask global population values by a stitched coverage raster.
+
+    The coverage raster defines the target grid for the output. Population is
+    read through a WarpedVRT on that grid, with nodata and negative values
+    treated as 0. Pixels where coverage is 0 are written as 0, and pixels where
+    coverage is positive retain their population value.
+
+    Args:
+        population_raster_path: Path-like global population raster to mask.
+        coverage_raster_path: Path-like binary coverage raster where values
+            greater than 0 indicate covered pixels.
+        target_population_raster_path: Path-like output raster where masked
+            population values will be written.
+
+    Returns:
+        Sum of the output masked population raster.
+    """
+    logger = logging.getLogger(__name__)
+    target_population_raster_path = Path(target_population_raster_path)
+    target_population_raster_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with rasterio.open(coverage_raster_path) as coverage:
+        with rasterio.open(population_raster_path) as population:
+            target_profile = coverage.profile.copy()
+            target_profile.update(
+                {
+                    "dtype": population.dtypes[0],
+                    "count": 1,
+                    "nodata": 0,
+                }
+            )
+            _set_tiled_geotiff_creation_options(target_profile)
+
+            vrt_kwargs = {
+                "crs": coverage.crs,
+                "transform": coverage.transform,
+                "width": coverage.width,
+                "height": coverage.height,
+                "resampling": Resampling.nearest,
+                "nodata": POPULATION_COMBINE_VRT_NODATA,
+            }
+            if population.nodata is not None:
+                vrt_kwargs["src_nodata"] = population.nodata
+
+            population_sum = np.float64(0)
+            with WarpedVRT(population, **vrt_kwargs) as population_vrt:
+                with rasterio.open(
+                    target_population_raster_path, "w", **target_profile
+                ) as target:
+                    for _, window in tqdm(
+                        coverage.block_windows(1),
+                        desc=f"mask population {Path(coverage_raster_path).stem}",
+                        unit="block",
+                    ):
+                        coverage_block = coverage.read(1, window=window)
+                        population_block = population_vrt.read(1, window=window)
+                        population_block = population_block.astype(
+                            target_profile["dtype"],
+                            copy=False,
+                        )
+                        population_block[population_block < 0] = 0
+                        masked_population = np.where(
+                            (coverage_block > 0) & (population_block > 0),
+                            population_block,
+                            0,
+                        )
+                        population_sum += np.sum(
+                            masked_population,
+                            dtype=np.float64,
+                        )
+                        target.write(masked_population, 1, window=window)
 
     logger.info(
-        "summing combined population raster %s", target_combined_pop_raster_path
+        "wrote population raster %s: %.6g",
+        target_population_raster_path,
+        population_sum,
     )
-    with _log_heartbeat(
-        logger,
-        lambda: f"summing combined population raster {target_combined_pop_raster_path}",
-    ):
-        pop_sums_by_id["combined pop"] = _sum_raster_blocks(
-            target_combined_pop_raster_path
-        )
-    logger.info(
-        "combined population raster sum complete for %s: %.6g",
-        target_combined_pop_raster_path,
-        pop_sums_by_id["combined pop"],
-    )
-
-    return pop_sums_by_id
+    return float(population_sum)
 
 
 def calculate_taskgraph_worker_count(config: dict, work_unit_count: int) -> int:
@@ -2207,7 +2219,6 @@ def main() -> None:
         working_dir = Path(config["work_dir"]) / Path(aoi_key)
         working_dir.mkdir(parents=True, exist_ok=True)
         picked_crs = choose_equidistant_crs_from_bbox(aoi_vector_path)
-        travel_time_aoi_vector_path = aoi_vector_path
         if has_conditional_mask:
             partition_paths = partition_subwatersheds_by_terminal_drain(
                 aoi_vector_path,
@@ -2218,7 +2229,6 @@ def main() -> None:
             )
             if debug_drain_index is not None:
                 selected_partition_id = next(iter(partition_paths))
-                travel_time_aoi_vector_path = partition_paths[selected_partition_id]
                 logger.info(
                     "keeping debug intermediates for %s %s in %s",
                     aoi_key,
@@ -2226,15 +2236,14 @@ def main() -> None:
                     working_dir / selected_partition_id,
                 )
                 logger.debug(
-                    "using %s as the travel-time AOI for debug_drain_index=%d",
-                    travel_time_aoi_vector_path,
+                    "using %s as the only drain partition for debug_drain_index=%d",
+                    partition_paths[selected_partition_id],
                     debug_drain_index,
                 )
         else:
             partition_paths = {}
         aoi_work_items[aoi_key] = {
             "aoi_vector_path": aoi_vector_path,
-            "travel_time_aoi_vector_path": travel_time_aoi_vector_path,
             "target_crs": picked_crs,
             "working_dir": working_dir,
             "partition_paths": partition_paths,
@@ -2256,17 +2265,14 @@ def main() -> None:
     logger.info("using %d TaskGraph workers", n_workers)
 
     task_graph = taskgraph.TaskGraph(config["work_dir"], n_workers, update_rate)
-    section_mask_ids = set()
-    combined_header = "combined pop"
-    section_mask_ids.add(combined_header)
-    pop_results = collections.defaultdict(dict)
+    population_result_ids = set()
+    union_population_id = "union_population"
+    population_result_ids.add(union_population_id)
+    population_results = collections.defaultdict(dict)
     for aoi_key, aoi_info in aoi_work_items.items():
         aoi_vector_path = aoi_info["aoi_vector_path"]
         working_dir = aoi_info["working_dir"]
-        base_raster_path_list = [
-            config["inputs"]["population_raster_path"],
-            config["inputs"]["dem_raster_path"],
-        ]
+        dem_raster_path = config["inputs"]["dem_raster_path"]
 
         partition_contexts = {}
         if has_conditional_mask:
@@ -2275,30 +2281,13 @@ def main() -> None:
             ].items():
                 partition_working_dir = working_dir / partition_id
                 partition_working_dir.mkdir(parents=True, exist_ok=True)
-                target_clipped_raster_path_list = [
-                    str(partition_working_dir / f"{Path(path).stem}_clipped.tif")
-                    for path in base_raster_path_list
-                ]
-
-                clipped_pop_raster_path = target_clipped_raster_path_list[0]
-                clipped_dem_path = target_clipped_raster_path_list[1]
-
-                pop_clip_task = task_graph.add_task(
-                    func=align_and_resize_raster_on_vector,
-                    args=(
-                        base_raster_path_list[0],
-                        clipped_pop_raster_path,
-                        "near",
-                        [wgs84_pixel_size, -wgs84_pixel_size],
-                        partition_vector_path,
-                    ),
-                    target_path_list=[clipped_pop_raster_path],
-                    task_name=f"clip population for {aoi_key} {partition_id}",
+                clipped_dem_path = str(
+                    partition_working_dir / f"{Path(dem_raster_path).stem}_clipped.tif"
                 )
                 dem_clip_task = task_graph.add_task(
                     func=align_and_resize_raster_on_vector,
                     args=(
-                        base_raster_path_list[1],
+                        dem_raster_path,
                         clipped_dem_path,
                         "near",
                         [wgs84_pixel_size, -wgs84_pixel_size],
@@ -2321,71 +2310,88 @@ def main() -> None:
                     task_name=f"calculate flow dir for {aoi_key} {partition_id}",
                 )
                 partition_contexts[partition_id] = {
-                    "clipped_pop_raster_path": Path(clipped_pop_raster_path),
+                    "vector_path": partition_vector_path,
                     "flow_dir_raster_path": Path(target_flow_dir_raster_path),
                     "flow_dir_task": flow_dir_task,
-                    "pop_clip_task": pop_clip_task,
                     "working_dir": partition_working_dir,
                 }
             if not partition_contexts:
                 raise ValueError(
                     f"No drain partitions were found for conditional AOI {aoi_key}."
                 )
+        else:
+            partition_contexts[aoi_key] = {
+                "vector_path": aoi_vector_path,
+                "flow_dir_raster_path": None,
+                "flow_dir_task": None,
+                "working_dir": working_dir,
+            }
 
-        pop_id_raster_list = []
-        section_pop_raster_tasks = []
+        coverage_raster_tasks = {}
+        coverage_id_raster_list = []
         for mask_section in config["masks"]:
             section_id = mask_section["id"]
-            section_mask_ids.add(section_id)
-            target_pop_raster_path = output_dir / f"{aoi_key}_{section_id}_pop.tif"
-            pop_id_raster_list.append((section_id, target_pop_raster_path))
+            population_result_ids.add(f"{section_id}_population")
+            target_coverage_raster_path = (
+                output_dir / f"{aoi_key}_{section_id}_coverage.tif"
+            )
+            partition_coverage_id_raster_list = []
+            partition_coverage_tasks = []
             if mask_section["type"] == "travel_time_population":
-                travel_time_working_dir = working_dir / section_id
-                travel_time_working_dir.mkdir(parents=True, exist_ok=True)
-                use_wgs84_bounds_mask = (
-                    aoi_key == FULL_RASTER_EXTENT_AOI_ID and debug_drain_index is None
-                )
-
-                travel_task = task_graph.add_task(
-                    func=apply_travel_time_mask,
-                    args=(
-                        config["inputs"]["traveltime_raster_path"],
-                        config["inputs"]["population_raster_path"],
-                        aoi_info["travel_time_aoi_vector_path"],
-                        mask_section["params"]["max_hours"],
-                        aoi_info["target_crs"].crs,
-                        target_pop_raster_path,
-                        travel_time_working_dir,
-                        use_wgs84_bounds_mask,
-                    ),
-                    store_result=True,
-                    target_path_list=[target_pop_raster_path],
-                    task_name=f"travel time for {aoi_key}",
-                )
-                section_pop_raster_tasks.append(travel_task)
+                for partition_id, partition_context in partition_contexts.items():
+                    partition_coverage_raster_path = (
+                        partition_context["working_dir"] / f"{section_id}_coverage.tif"
+                    )
+                    partition_coverage_id_raster_list.append(
+                        (partition_id, partition_coverage_raster_path)
+                    )
+                    travel_time_working_dir = (
+                        partition_context["working_dir"] / f"{section_id}_workdir"
+                    )
+                    use_wgs84_bounds_mask = (
+                        aoi_key == FULL_RASTER_EXTENT_AOI_ID
+                        and not has_conditional_mask
+                        and debug_drain_index is None
+                    )
+                    travel_task = task_graph.add_task(
+                        func=calculate_travel_time_coverage,
+                        args=(
+                            config["inputs"]["traveltime_raster_path"],
+                            partition_context["vector_path"],
+                            mask_section["params"]["max_hours"],
+                            aoi_info["target_crs"].crs,
+                            partition_coverage_raster_path,
+                            travel_time_working_dir,
+                            use_wgs84_bounds_mask,
+                        ),
+                        target_path_list=[partition_coverage_raster_path],
+                        task_name=(
+                            f"travel-time coverage {section_id} "
+                            f"for {aoi_key} {partition_id}"
+                        ),
+                    )
+                    partition_coverage_tasks.append(travel_task)
             elif mask_section["type"] == "conditional_raster":
-                partition_pop_id_raster_list = []
-                partition_pop_tasks = []
                 for (
                     partition_id,
                     partition_context,
                 ) in partition_contexts.items():
-                    if len(partition_contexts) == 1:
-                        partition_pop_raster_path = target_pop_raster_path
-                    else:
-                        partition_pop_raster_path = (
-                            partition_context["working_dir"] / f"{section_id}_pop.tif"
+                    if partition_context["flow_dir_task"] is None:
+                        raise ValueError(
+                            "conditional_raster masks require drain partitions "
+                            "and flow-direction rasters."
                         )
-                    partition_pop_id_raster_list.append(
-                        (partition_id, partition_pop_raster_path)
+                    partition_coverage_raster_path = (
+                        partition_context["working_dir"] / f"{section_id}_coverage.tif"
                     )
-                    partition_vector_path = aoi_info["partition_paths"][partition_id]
+                    partition_coverage_id_raster_list.append(
+                        (partition_id, partition_coverage_raster_path)
+                    )
                     conditional_task = task_graph.add_task(
-                        func=calculate_ds_pop_from_conditional_raster,
+                        func=calculate_downstream_coverage_from_conditional_raster,
                         args=(
-                            partition_vector_path,
+                            partition_context["vector_path"],
                             partition_context["flow_dir_raster_path"],
-                            partition_context["clipped_pop_raster_path"],
                             Path(mask_section["params"]["condition_raster_path"]),
                             section_id,
                             mask_section["params"]["expression"],
@@ -2395,72 +2401,96 @@ def main() -> None:
                             ),
                             config["inputs"]["travel_time_pixel_size_m"],
                             partition_context["working_dir"],
-                            partition_pop_raster_path,
+                            partition_coverage_raster_path,
                         ),
-                        dependent_task_list=[
-                            partition_context["flow_dir_task"],
-                            partition_context["pop_clip_task"],
-                        ],
-                        store_result=True,
-                        target_path_list=[partition_pop_raster_path],
+                        dependent_task_list=[partition_context["flow_dir_task"]],
+                        target_path_list=[partition_coverage_raster_path],
                         task_name=(
                             f"conditional downstream {section_id} "
                             f"for {aoi_key} {partition_id}"
                         ),
                     )
-                    partition_pop_tasks.append(conditional_task)
-
-                if len(partition_contexts) == 1:
-                    section_pop_raster_tasks.append(partition_pop_tasks[0])
-                else:
-                    section_combine_task = task_graph.add_task(
-                        func=combine_pops,
-                        args=(
-                            partition_pop_id_raster_list,
-                            wgs84_pixel_size,
-                            working_dir / f"combine_{section_id}",
-                            target_pop_raster_path,
-                        ),
-                        dependent_task_list=partition_pop_tasks,
-                        store_result=True,
-                        target_path_list=[target_pop_raster_path],
-                        task_name=f"combine partitions for {aoi_key} {section_id}",
-                    )
-                    section_pop_raster_tasks.append(section_combine_task)
+                    partition_coverage_tasks.append(conditional_task)
             else:
                 raise ValueError(f"unknown mask section type: {mask_section['type']}")
 
-        target_combined_pop_raster_path = output_dir / f"{aoi_key}_total_pop.tif"
-        combined_task = task_graph.add_task(
-            func=combine_pops,
+            section_coverage_task = task_graph.add_task(
+                func=stitch_coverage_masks,
+                args=(
+                    partition_coverage_id_raster_list,
+                    wgs84_pixel_size,
+                    working_dir / f"stitch_{section_id}_coverage",
+                    target_coverage_raster_path,
+                ),
+                dependent_task_list=partition_coverage_tasks,
+                target_path_list=[target_coverage_raster_path],
+                task_name=f"stitch coverage for {aoi_key} {section_id}",
+            )
+            coverage_raster_tasks[section_id] = section_coverage_task
+            coverage_id_raster_list.append((section_id, target_coverage_raster_path))
+
+            target_population_raster_path = (
+                output_dir / f"{aoi_key}_{section_id}_population.tif"
+            )
+            population_task = task_graph.add_task(
+                func=mask_population_with_coverage,
+                args=(
+                    config["inputs"]["population_raster_path"],
+                    target_coverage_raster_path,
+                    target_population_raster_path,
+                ),
+                dependent_task_list=[section_coverage_task],
+                store_result=True,
+                target_path_list=[target_population_raster_path],
+                task_name=f"mask population for {aoi_key} {section_id}",
+            )
+            population_results[aoi_key][f"{section_id}_population"] = population_task
+
+        target_union_coverage_raster_path = output_dir / f"{aoi_key}_union_coverage.tif"
+        union_coverage_task = task_graph.add_task(
+            func=stitch_coverage_masks,
             args=(
-                pop_id_raster_list,
+                coverage_id_raster_list,
                 wgs84_pixel_size,
-                working_dir,
-                target_combined_pop_raster_path,
+                working_dir / "stitch_union_coverage",
+                target_union_coverage_raster_path,
             ),
-            dependent_task_list=section_pop_raster_tasks,
-            store_result=True,
-            target_path_list=[target_combined_pop_raster_path],
-            task_name=f"combined pop for {aoi_key}",
+            dependent_task_list=list(coverage_raster_tasks.values()),
+            target_path_list=[target_union_coverage_raster_path],
+            task_name=f"stitch union coverage for {aoi_key}",
         )
-        pop_results[aoi_key][combined_header] = combined_task
+
+        target_union_population_raster_path = (
+            output_dir / f"{aoi_key}_union_population.tif"
+        )
+        union_population_task = task_graph.add_task(
+            func=mask_population_with_coverage,
+            args=(
+                config["inputs"]["population_raster_path"],
+                target_union_coverage_raster_path,
+                target_union_population_raster_path,
+            ),
+            dependent_task_list=[union_coverage_task],
+            store_result=True,
+            target_path_list=[target_union_population_raster_path],
+            task_name=f"mask population for {aoi_key} union",
+        )
+        population_results[aoi_key][union_population_id] = union_population_task
 
     task_graph.close()
     task_graph.join()
     rows = []
-    for aoi_key, results in pop_results.items():
+    for aoi_key, results in population_results.items():
         row = {"aoi": aoi_key}
-        pop_count_results = results[combined_header].get()
-        for header in section_mask_ids:
-            row[header] = pop_count_results.get(header, "n/a")
+        for header in population_result_ids:
+            row[header] = results[header].get() if header in results else "n/a"
         rows.append(row)
 
-    df = pd.DataFrame(rows, columns=["aoi"] + list(section_mask_ids))
+    df = pd.DataFrame(rows, columns=["aoi"] + list(population_result_ids))
     cols = (
         ["aoi"]
-        + [c for c in df.columns if c not in ("aoi", "combined pop")]
-        + ["combined pop"]
+        + [c for c in df.columns if c not in ("aoi", union_population_id)]
+        + [union_population_id]
     )
     df = df[cols]
     csv_path = (
