@@ -4,3 +4,5 @@ configs/
 # but keep the directory itself and the file
 !configs/
 !configs/example_roadmap2030_pop_downstream_analysis.yaml
+data/
+configs/
