@@ -1,6 +1,9 @@
 import unittest
+from pathlib import Path
+import tempfile
 
 import numpy as np
+import rasterio
 from pyproj import CRS, Transformer
 from rasterio.transform import from_origin
 from shapely.geometry import Point, box
@@ -111,6 +114,103 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
             1,
         )
         self.assertEqual(mask[0, 0], 1)
+
+    def test_stitch_coverage_masks_uses_union_semantics(self):
+        profile = {
+            "driver": "GTiff",
+            "height": 2,
+            "width": 2,
+            "count": 1,
+            "dtype": "uint8",
+            "crs": "EPSG:4326",
+            "transform": from_origin(0, 2, 1, 1),
+            "nodata": 0,
+        }
+        workflow_runner._set_tiled_geotiff_creation_options(profile)
+
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            coverage_a_path = workspace_path / "coverage_a.tif"
+            coverage_b_path = workspace_path / "coverage_b.tif"
+            target_path = workspace_path / "stitched.tif"
+            with rasterio.open(coverage_a_path, "w", **profile) as coverage_a:
+                coverage_a.write(
+                    np.array([[1, 0], [0, 0]], dtype=np.uint8),
+                    1,
+                )
+            with rasterio.open(coverage_b_path, "w", **profile) as coverage_b:
+                coverage_b.write(
+                    np.array([[0, 1], [0, 0]], dtype=np.uint8),
+                    1,
+                )
+
+            workflow_runner.stitch_coverage_masks(
+                [
+                    ("a", coverage_a_path),
+                    ("b", coverage_b_path),
+                ],
+                1,
+                workspace_path / "work",
+                target_path,
+            )
+
+            with rasterio.open(target_path) as stitched:
+                result = stitched.read(1)
+
+        np.testing.assert_array_equal(
+            result,
+            np.array([[1, 1], [0, 0]], dtype=np.uint8),
+        )
+
+    def test_mask_population_with_coverage_applies_coverage_once(self):
+        transform = from_origin(0, 2, 1, 1)
+        coverage_profile = {
+            "driver": "GTiff",
+            "height": 2,
+            "width": 2,
+            "count": 1,
+            "dtype": "uint8",
+            "crs": "EPSG:4326",
+            "transform": transform,
+            "nodata": 0,
+        }
+        population_profile = {
+            **coverage_profile,
+            "dtype": "int32",
+        }
+        workflow_runner._set_tiled_geotiff_creation_options(coverage_profile)
+        workflow_runner._set_tiled_geotiff_creation_options(population_profile)
+
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            coverage_path = workspace_path / "coverage.tif"
+            population_path = workspace_path / "population.tif"
+            target_path = workspace_path / "masked_population.tif"
+            with rasterio.open(coverage_path, "w", **coverage_profile) as coverage:
+                coverage.write(
+                    np.array([[1, 0], [1, 0]], dtype=np.uint8),
+                    1,
+                )
+            with rasterio.open(population_path, "w", **population_profile) as pop:
+                pop.write(
+                    np.array([[10, 20], [30, 40]], dtype=np.int32),
+                    1,
+                )
+
+            population_sum = workflow_runner.mask_population_with_coverage(
+                population_path,
+                coverage_path,
+                target_path,
+            )
+
+            with rasterio.open(target_path) as masked_population:
+                result = masked_population.read(1)
+
+        np.testing.assert_array_equal(
+            result,
+            np.array([[10, 0], [30, 0]], dtype=np.int32),
+        )
+        self.assertEqual(population_sum, 40)
 
 
 if __name__ == "__main__":
