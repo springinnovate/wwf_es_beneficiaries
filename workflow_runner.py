@@ -61,6 +61,7 @@ import shortest_distances
 RASTER_BLOCK_SIZE = 256
 HEARTBEAT_INTERVAL_SECONDS = 60
 TRAVEL_TIME_MAX_DISTANCE_M_PER_HOUR = 104_000
+TRAVEL_TIME_MAX_WINDOW_BYTES = 2 * 1024**3
 POPULATION_COMBINE_VRT_NODATA = -1
 DISTANCE_TRANSFORM_NODATA = -1
 DOWNSTREAM_COVERAGE_EPSILON = 100 * np.finfo(float).eps
@@ -1393,11 +1394,204 @@ def _clip_and_reproject_raster(
             )
 
 
+def _buffer_window(window: Window, buffer_pixels: int, width: int, height: int) -> Window:
+    """Expand ``window`` by ``buffer_pixels`` and clamp to raster dimensions."""
+    return _integer_window(
+        Window(
+            window.col_off - buffer_pixels,
+            window.row_off - buffer_pixels,
+            window.width + 2 * buffer_pixels,
+            window.height + 2 * buffer_pixels,
+        ),
+        width,
+        height,
+    )
+
+
+def _estimate_travel_reach_bytes(width: int, height: int, friction_dtype) -> int:
+    """Estimate array memory needed by one ``find_mask_reach`` window."""
+    pixel_count = int(width) * int(height)
+    friction_bytes = np.dtype(friction_dtype).itemsize
+    return pixel_count * (friction_bytes + np.dtype(np.int8).itemsize + 5)
+
+
+def _raster_block_count(width: int, height: int, block_size: int) -> int:
+    """Return the number of block windows needed to cover a raster."""
+    return math.ceil(width / block_size) * math.ceil(height / block_size)
+
+
+def _write_mask_raster_by_window(
+    target_mask_raster_path,
+    raster_profile,
+    source_geometries,
+    use_wgs84_bounds_mask=False,
+    wgs84_bounds=None,
+):
+    """Write a binary AOI mask raster without allocating the full raster."""
+    target_mask_raster_path = Path(target_mask_raster_path)
+    target_mask_raster_path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(target_mask_raster_path, "w", **raster_profile) as target:
+        block_count = _raster_block_count(
+            target.width,
+            target.height,
+            RASTER_BLOCK_SIZE,
+        )
+        for _, window in tqdm(
+            target.block_windows(1),
+            total=block_count,
+            desc=f"rasterize {target_mask_raster_path.stem}",
+            unit="block",
+        ):
+            if use_wgs84_bounds_mask:
+                mask_array = _rasterize_wgs84_bounds_mask(
+                    wgs84_bounds,
+                    rasterio.windows.transform(window, target.transform),
+                    target.crs,
+                    int(window.height),
+                    int(window.width),
+                ).astype(np.uint8, copy=False)
+            else:
+                mask_array = rasterio.features.rasterize(
+                    ((geom, 1) for geom in source_geometries),
+                    out_shape=(int(window.height), int(window.width)),
+                    transform=rasterio.windows.transform(window, target.transform),
+                    fill=0,
+                    dtype=rasterio.uint8,
+                )
+            target.write(mask_array, 1, window=window)
+
+
+def calculate_windowed_travel_reach(
+    friction_raster_path,
+    source_mask_raster_path,
+    target_coverage_raster_path,
+    max_time_mins,
+    buffer_pixels,
+    core_block_size=RASTER_BLOCK_SIZE,
+    max_window_bytes=TRAVEL_TIME_MAX_WINDOW_BYTES,
+    progress_label=None,
+):
+    """Calculate travel reach by OR-ing buffered source-mask windows.
+
+    The reach operation is equivalent to running the whole source mask at
+    once, but each Dijkstra expansion is bounded to a core source block plus
+    the maximum possible travel distance. This keeps memory proportional to a
+    buffered block instead of to the full drain basin.
+    """
+    logger = logging.getLogger(__name__)
+    target_coverage_raster_path = Path(target_coverage_raster_path)
+
+    with rasterio.open(friction_raster_path) as friction:
+        target_profile = friction.profile.copy()
+        target_profile.update({"count": 1, "dtype": rasterio.uint8, "nodata": 0})
+        _set_tiled_geotiff_creation_options(target_profile)
+        cell_length_m = abs(friction.transform.a)
+        full_window = Window(0, 0, friction.width, friction.height)
+        total_windows = _raster_block_count(
+            friction.width,
+            friction.height,
+            core_block_size,
+        )
+        logger.info(
+            "windowed travel reach: raster=%sx%s px, core=%s px, "
+            "buffer=%s px, max_time=%.1f min",
+            friction.width,
+            friction.height,
+            core_block_size,
+            buffer_pixels,
+            max_time_mins,
+        )
+
+    _create_zeroed_raster(
+        target_coverage_raster_path,
+        target_profile,
+        desc=f"initialize {target_coverage_raster_path.stem}",
+    )
+
+    processed_windows = 0
+    skipped_windows = 0
+    with rasterio.open(friction_raster_path) as friction:
+        with rasterio.open(source_mask_raster_path) as source_mask:
+            with rasterio.open(target_coverage_raster_path, "r+") as target:
+                progress = tqdm(
+                    _iter_block_windows(full_window, core_block_size),
+                    total=total_windows,
+                    desc=progress_label or f"travel windows {target_coverage_raster_path.stem}",
+                    unit="window",
+                )
+                for core_window in progress:
+                    core_mask = source_mask.read(1, window=core_window)
+                    if not np.any(core_mask == 1):
+                        skipped_windows += 1
+                        continue
+
+                    buffered_window = _buffer_window(
+                        core_window,
+                        buffer_pixels,
+                        friction.width,
+                        friction.height,
+                    )
+                    estimated_bytes = _estimate_travel_reach_bytes(
+                        int(buffered_window.width),
+                        int(buffered_window.height),
+                        friction.dtypes[0],
+                    )
+                    if estimated_bytes > max_window_bytes:
+                        raise ValueError(
+                            "Travel-time reach window is too large: "
+                            f"{int(buffered_window.width)}x"
+                            f"{int(buffered_window.height)} px, estimated "
+                            f"{estimated_bytes / 1024**3:.2f} GiB. "
+                            "Reduce the travel-time core block size or review "
+                            "the travel-time buffer distance."
+                        )
+
+                    friction_array = friction.read(1, window=buffered_window).astype(
+                        np.float32,
+                        copy=False,
+                    )
+                    source_array = np.zeros(friction_array.shape, dtype=np.int8)
+                    row_start = int(core_window.row_off - buffered_window.row_off)
+                    col_start = int(core_window.col_off - buffered_window.col_off)
+                    row_stop = row_start + int(core_window.height)
+                    col_stop = col_start + int(core_window.width)
+                    source_array[row_start:row_stop, col_start:col_stop] = (
+                        core_mask == 1
+                    ).astype(np.int8)
+
+                    n_rows, n_cols = friction_array.shape
+                    reach_array = shortest_distances.find_mask_reach(
+                        friction_array,
+                        source_array,
+                        cell_length_m,
+                        n_cols,
+                        n_rows,
+                        max_time_mins,
+                        progress_interval_seconds=0,
+                    )
+
+                    existing_array = target.read(1, window=buffered_window)
+                    np.maximum(existing_array, reach_array, out=existing_array)
+                    target.write(existing_array, 1, window=buffered_window)
+                    processed_windows += 1
+                    progress.set_postfix(
+                        processed=processed_windows,
+                        skipped=skipped_windows,
+                    )
+
+    logger.info(
+        "wrote windowed travel coverage %s from %d source windows",
+        target_coverage_raster_path,
+        processed_windows,
+    )
+    return target_coverage_raster_path
+
+
 def calculate_travel_time_coverage(
     traveltime_raster_path: Path,
     aoi_vector_path: Path,
     max_hours: float,
-    target_crs: str,
+    travel_time_pixel_size_m: float,
     target_coverage_raster_path: Path,
     working_dir: Path,
     use_wgs84_bounds_mask: bool = False,
@@ -1410,6 +1604,8 @@ def calculate_travel_time_coverage(
         aoi_vector_path (str | Path): Path to a vector dataset (e.g. Shapefile,
             GeoPackage) defining the area of interest to clip to.
         max_hours (float): Maximum travel time in hours to include.
+        travel_time_pixel_size_m (float): Target travel-time raster pixel size
+            in meters.
         use_wgs84_bounds_mask (bool): If true, rasterize the AOI as a WGS84
             bounds mask from pixel centers. This is intended for generated
             full-extent AOIs, where projecting a near-global rectangle into a
@@ -1423,9 +1619,10 @@ def calculate_travel_time_coverage(
     working_dir = Path(working_dir)
     working_dir.mkdir(parents=True, exist_ok=True)
 
+    analysis_crs = choose_equidistant_crs_from_bbox(str(aoi_vector_path)).crs
     aoi_vector = gpd.read_file(aoi_vector_path)
     aoi_wgs84_bounds = aoi_vector.to_crs("EPSG:4326").total_bounds
-    projected_gdf = aoi_vector.to_crs(target_crs)
+    projected_gdf = aoi_vector.to_crs(analysis_crs)
     bbox = projected_gdf.total_bounds
     # This max-distance bound is precomputed for the global friction raster
     # used by this workflow.
@@ -1446,32 +1643,43 @@ def calculate_travel_time_coverage(
     )
     target_aoi_raster_path = Path(working_dir / "travel_time_aoi_mask.tif")
 
-    _clip_and_reproject_raster(
-        traveltime_raster_path,
-        bbox_gdf,
-        projected_gdf.crs,
-        target_friction_clipped_raster_path,
+    logger.info(
+        "preparing travel-time coverage for %s in %s",
+        Path(aoi_vector_path).stem,
+        analysis_crs,
     )
+    with _log_heartbeat(
+        logger,
+        lambda: (
+            "warping travel-time raster for "
+            f"{Path(aoi_vector_path).stem} to {target_friction_clipped_raster_path}"
+        ),
+    ):
+        geoprocessing.warp_raster(
+            str(traveltime_raster_path),
+            (travel_time_pixel_size_m, -travel_time_pixel_size_m),
+            str(target_friction_clipped_raster_path),
+            "near",
+            target_bb=buffered_bbox.bounds,
+            target_projection_wkt=analysis_crs.to_wkt(),
+            working_dir=str(working_dir),
+            output_type=gdal.GDT_Float32,
+            raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
+        )
 
     with rasterio.open(target_friction_clipped_raster_path) as friction_ref:
-        ref_meta = friction_ref.meta.copy()
-
-    if use_wgs84_bounds_mask:
-        mask_array = _rasterize_wgs84_bounds_mask(
-            aoi_wgs84_bounds,
-            ref_meta["transform"],
-            ref_meta["crs"],
-            ref_meta["height"],
-            ref_meta["width"],
+        ref_meta = friction_ref.profile.copy()
+        cell_length_m = abs(friction_ref.transform.a)
+        buffer_pixels = int(math.ceil(buffer_distance_m / cell_length_m))
+        logger.info(
+            "travel-time window setup for %s: raster=%sx%s px, "
+            "buffer=%s m (%s px)",
+            Path(aoi_vector_path).stem,
+            friction_ref.width,
+            friction_ref.height,
+            int(buffer_distance_m),
+            buffer_pixels,
         )
-    else:
-        mask_array = rasterio.features.rasterize(
-            ((geom, 1) for geom in projected_gdf.geometry),
-            out_shape=(ref_meta["height"], ref_meta["width"]),
-            transform=ref_meta["transform"],
-            fill=0,
-            dtype=rasterio.uint8,
-        ).astype(np.int8)
 
     aoi_meta = ref_meta.copy()
     aoi_meta.update(
@@ -1479,30 +1687,22 @@ def calculate_travel_time_coverage(
     )
     _set_tiled_geotiff_creation_options(aoi_meta)
 
-    with rasterio.open(target_aoi_raster_path, "w", **aoi_meta) as dst:
-        dst.write(mask_array, 1)
-
-    with rasterio.open(target_friction_clipped_raster_path) as friction_ds:
-        friction_array = friction_ds.read(1)
-        transform = friction_ds.transform
-        cell_length_m = transform.a
-        n_rows, n_cols = friction_array.shape
-
-    travel_reach_array = shortest_distances.find_mask_reach(
-        friction_array,
-        mask_array,
-        cell_length_m,
-        n_cols,
-        n_rows,
-        max_time_mins,
-        progress_interval_seconds=0,
+    _write_mask_raster_by_window(
+        target_aoi_raster_path,
+        aoi_meta,
+        projected_gdf.geometry,
+        use_wgs84_bounds_mask=use_wgs84_bounds_mask,
+        wgs84_bounds=aoi_wgs84_bounds,
     )
 
-    with rasterio.open(target_coverage_raster_path, "w", **aoi_meta) as max_reach:
-        max_reach.write(travel_reach_array, 1)
-
-    travel_reach_array = None
-    return target_coverage_raster_path
+    return calculate_windowed_travel_reach(
+        target_friction_clipped_raster_path,
+        target_aoi_raster_path,
+        target_coverage_raster_path,
+        max_time_mins,
+        buffer_pixels,
+        progress_label=f"travel windows {Path(aoi_vector_path).stem}",
+    )
 
 
 def create_distance_transform(
@@ -1952,13 +2152,18 @@ def _rasterize_wgs84_bounds_mask(
     return mask_array
 
 
-def _create_zeroed_raster(target_path: Path, profile: dict) -> None:
+def _create_zeroed_raster(
+    target_path: Path,
+    profile: dict,
+    desc: str = "initialize combined raster",
+) -> None:
     """Create a zero-filled raster for later windowed max writes.
 
     Args:
         target_path: Path where the output raster should be created.
         profile: Rasterio profile describing the target raster. The profile is
             expected to include the 256 x 256 tiled GeoTIFF creation options.
+        desc: Progress-bar description for the initialization pass.
 
     Returns:
         None.
@@ -1972,7 +2177,7 @@ def _create_zeroed_raster(target_path: Path, profile: dict) -> None:
         for _, window in tqdm(
             target.block_windows(1),
             total=block_count,
-            desc="initialize combined raster",
+            desc=desc,
             unit="block",
         ):
             target.write(
@@ -2285,6 +2490,7 @@ def main() -> None:
     union_population_id = "union_population"
     population_result_ids.add(union_population_id)
     population_results = collections.defaultdict(dict)
+    task_progress_paths = []
     for aoi_key, aoi_info in aoi_work_items.items():
         aoi_vector_path = aoi_info["aoi_vector_path"]
         working_dir = aoi_info["working_dir"]
@@ -2358,6 +2564,7 @@ def main() -> None:
                     partition_coverage_raster_path = (
                         partition_context["working_dir"] / f"{section_id}_coverage.tif"
                     )
+                    task_progress_paths.append(partition_coverage_raster_path)
                     partition_coverage_id_raster_list.append(
                         (partition_id, partition_coverage_raster_path)
                     )
@@ -2375,7 +2582,7 @@ def main() -> None:
                             config["inputs"]["traveltime_raster_path"],
                             partition_context["vector_path"],
                             mask_section["params"]["max_hours"],
-                            aoi_info["target_crs"].crs,
+                            config["inputs"]["travel_time_pixel_size_m"],
                             partition_coverage_raster_path,
                             travel_time_working_dir,
                             use_wgs84_bounds_mask,
@@ -2400,6 +2607,7 @@ def main() -> None:
                     partition_coverage_raster_path = (
                         partition_context["working_dir"] / f"{section_id}_coverage.tif"
                     )
+                    task_progress_paths.append(partition_coverage_raster_path)
                     partition_coverage_id_raster_list.append(
                         (partition_id, partition_coverage_raster_path)
                     )
@@ -2443,6 +2651,7 @@ def main() -> None:
                 task_name=f"stitch coverage for {aoi_key} {section_id}",
             )
             coverage_raster_tasks[section_id] = section_coverage_task
+            task_progress_paths.append(target_coverage_raster_path)
             coverage_id_raster_list.append((section_id, target_coverage_raster_path))
 
             target_population_raster_path = (
@@ -2461,8 +2670,10 @@ def main() -> None:
                 task_name=f"mask population for {aoi_key} {section_id}",
             )
             population_results[aoi_key][f"{section_id}_population"] = population_task
+            task_progress_paths.append(target_population_raster_path)
 
         target_union_coverage_raster_path = output_dir / f"{aoi_key}_union_coverage.tif"
+        task_progress_paths.append(target_union_coverage_raster_path)
         union_coverage_task = task_graph.add_task(
             func=stitch_coverage_masks,
             args=(
@@ -2492,9 +2703,24 @@ def main() -> None:
             task_name=f"mask population for {aoi_key} union",
         )
         population_results[aoi_key][union_population_id] = union_population_task
+        task_progress_paths.append(target_union_population_raster_path)
 
     task_graph.close()
-    task_graph.join()
+    def _task_progress_message() -> str:
+        complete_count = 0
+        for target_path in task_progress_paths:
+            try:
+                if Path(target_path).exists() and Path(target_path).stat().st_size > 0:
+                    complete_count += 1
+            except OSError:
+                pass
+        return (
+            "workflow tasks running: "
+            f"{complete_count}/{len(task_progress_paths)} target rasters present"
+        )
+
+    with _log_heartbeat(logger, _task_progress_message):
+        task_graph.join()
     rows = []
     for aoi_key, results in population_results.items():
         row = {"aoi": aoi_key}
