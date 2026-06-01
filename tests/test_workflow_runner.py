@@ -261,6 +261,26 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
 
         np.testing.assert_array_equal(result, expected)
 
+    def test_travel_reach_priority_queue_guard_reports_window_context(self):
+        friction = np.ones((3, 3), dtype=np.float32)
+        source_mask = np.zeros((3, 3), dtype=np.int8)
+        source_mask[1, 1] = 1
+
+        with self.assertRaisesRegex(
+            MemoryError,
+            "travel reach priority queue exceeded guard limit",
+        ):
+            workflow_runner.shortest_distances.find_mask_reach(
+                friction,
+                source_mask,
+                1.0,
+                3,
+                3,
+                2.0,
+                progress_interval_seconds=0,
+                queue_guard_multiplier=0,
+            )
+
     def test_mask_population_with_coverage_applies_coverage_once(self):
         transform = from_origin(0, 2, 1, 1)
         coverage_profile = {

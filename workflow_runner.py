@@ -129,6 +129,26 @@ def _memory_status_text() -> str:
     )
 
 
+@contextlib.contextmanager
+def _log_memory_scope(logger: logging.Logger, label: str):
+    """Log process-tree memory before and after a diagnostic scope."""
+    start_time = time.monotonic()
+    start_rss = _process_tree_rss_bytes()
+    logger.info("%s started; %s", label, _memory_status_text())
+    try:
+        yield
+    finally:
+        end_rss = _process_tree_rss_bytes()
+        elapsed_seconds = time.monotonic() - start_time
+        logger.info(
+            "%s finished in %.1fs; rss_delta=%s; %s",
+            label,
+            elapsed_seconds,
+            _format_bytes(end_rss - start_rss),
+            _memory_status_text(),
+        )
+
+
 def _set_tiled_geotiff_creation_options(raster_meta: dict) -> None:
     """Set Rasterio creation options for block-aligned GeoTIFF writes."""
     raster_meta.update(
@@ -1603,7 +1623,7 @@ def calculate_windowed_travel_reach(
                     desc=progress_label or f"travel windows {target_coverage_raster_path.stem}",
                     unit="window",
                 )
-                for core_window in progress:
+                for window_index, core_window in enumerate(progress, start=1):
                     core_mask = source_mask.read(1, window=core_window)
                     if not np.any(core_mask == 1):
                         skipped_windows += 1
@@ -1644,15 +1664,24 @@ def calculate_windowed_travel_reach(
                     ).astype(np.int8)
 
                     n_rows, n_cols = friction_array.shape
-                    reach_array = shortest_distances.find_mask_reach(
-                        friction_array,
-                        source_array,
-                        cell_length_m,
-                        n_cols,
-                        n_rows,
-                        max_time_mins,
-                        progress_interval_seconds=0,
+                    reach_label = (
+                        "find_mask_reach "
+                        f"{target_coverage_raster_path.stem} "
+                        f"window={window_index}/{total_windows} "
+                        f"core={int(core_window.width)}x{int(core_window.height)} "
+                        f"buffered={n_cols}x{n_rows} "
+                        f"estimated_arrays={_format_bytes(estimated_bytes)}"
                     )
+                    with _log_memory_scope(logger, reach_label):
+                        reach_array = shortest_distances.find_mask_reach(
+                            friction_array,
+                            source_array,
+                            cell_length_m,
+                            n_cols,
+                            n_rows,
+                            max_time_mins,
+                            progress_interval_seconds=0,
+                        )
 
                     existing_array = target.read(1, window=buffered_window)
                     np.maximum(existing_array, reach_array, out=existing_array)
@@ -1700,6 +1729,10 @@ def calculate_travel_time_coverage(
     """
     configure_gdal_cache()
     logger = logging.getLogger(__name__)
+    worker_label = f"travel-time coverage worker {Path(aoi_vector_path).stem}"
+    worker_start_time = time.monotonic()
+    worker_start_rss = _process_tree_rss_bytes()
+    logger.info("%s started; %s", worker_label, _memory_status_text())
     max_time_mins = max_hours * 60
     working_dir = Path(working_dir)
     working_dir.mkdir(parents=True, exist_ok=True)
@@ -1780,7 +1813,7 @@ def calculate_travel_time_coverage(
         wgs84_bounds=aoi_wgs84_bounds,
     )
 
-    return calculate_windowed_travel_reach(
+    result_path = calculate_windowed_travel_reach(
         target_friction_clipped_raster_path,
         target_aoi_raster_path,
         target_coverage_raster_path,
@@ -1788,6 +1821,14 @@ def calculate_travel_time_coverage(
         buffer_pixels,
         progress_label=f"travel windows {Path(aoi_vector_path).stem}",
     )
+    logger.info(
+        "%s finished in %.1fs; rss_delta=%s; %s",
+        worker_label,
+        time.monotonic() - worker_start_time,
+        _format_bytes(_process_tree_rss_bytes() - worker_start_rss),
+        _memory_status_text(),
+    )
+    return result_path
 
 
 def create_distance_transform(
@@ -1929,6 +1970,10 @@ def calculate_downstream_coverage_from_conditional_raster(
     """
     configure_gdal_cache()
     logger = logging.getLogger(__name__)
+    worker_label = f"downstream coverage worker {condition_id} {Path(aoi_vector_path).stem}"
+    worker_start_time = time.monotonic()
+    worker_start_rss = _process_tree_rss_bytes()
+    logger.info("%s started; %s", worker_label, _memory_status_text())
     logger.debug(f"max downstream distance: {max_downstream_distance_m}")
     condition_raster_path = working_dir / f"mask_{condition_id}_{base_raster_path.name}"
 
@@ -2040,11 +2085,23 @@ def calculate_downstream_coverage_from_conditional_raster(
         calc_raster_stats=False,
         raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
     )
+    logger.info(
+        "%s finished in %.1fs; rss_delta=%s; %s",
+        worker_label,
+        time.monotonic() - worker_start_time,
+        _format_bytes(_process_tree_rss_bytes() - worker_start_rss),
+        _memory_status_text(),
+    )
     return target_coverage_raster_path
 
 
 def calc_flow_dir(dem_path, working_dir, target_flow_dir_raster_path):
     configure_gdal_cache()
+    logger = logging.getLogger(__name__)
+    worker_label = f"flow direction worker {Path(target_flow_dir_raster_path).stem}"
+    worker_start_time = time.monotonic()
+    worker_start_rss = _process_tree_rss_bytes()
+    logger.info("%s started; %s", worker_label, _memory_status_text())
     pit_filled_raster_path = working_dir / f"pit_filled_{Path(dem_path).name}"
     routing.fill_pits(
         (dem_path, 1),
@@ -2057,6 +2114,13 @@ def calc_flow_dir(dem_path, working_dir, target_flow_dir_raster_path):
         str(target_flow_dir_raster_path),
         working_dir=str(working_dir),
         raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
+    )
+    logger.info(
+        "%s finished in %.1fs; rss_delta=%s; %s",
+        worker_label,
+        time.monotonic() - worker_start_time,
+        _format_bytes(_process_tree_rss_bytes() - worker_start_rss),
+        _memory_status_text(),
     )
 
 

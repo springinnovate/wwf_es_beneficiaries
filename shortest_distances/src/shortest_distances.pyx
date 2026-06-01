@@ -71,8 +71,9 @@ def find_mask_reach(
         float cell_length_m,
         int n_cols, int n_rows,
         float max_time,
-        int progress_interval_seconds=10):
-    """Define later
+        int progress_interval_seconds=10,
+        int queue_guard_multiplier=3):
+    """Calculate the pixels reachable from a source mask.
 
     Parameters:
         friction_array (numpy.ndarray): array with friction values for
@@ -85,6 +86,13 @@ def find_mask_reach(
         progress_interval_seconds (int): minimum number of seconds between
             travel-reach heartbeat log messages. Set to 0 to disable progress
             logging.
+        queue_guard_multiplier (int): Fail if the internal priority queue
+            exceeds this multiple of the input raster pixel count.
+
+    Raises:
+        MemoryError: If the internal priority queue grows beyond
+            ``queue_guard_multiplier`` times the number of pixels in
+            ``friction_array``.
 
     Returns:
         2D array of mask reach of the same size as input arrays.
@@ -114,7 +122,11 @@ def find_mask_reach(
     cdef double pop_rate = 0
     cdef double frontier_percent = 0
     cdef size_t queue_size
+    cdef size_t pixel_count = <size_t>n_cols * <size_t>n_rows
+    cdef size_t queue_guard_limit = <size_t>queue_guard_multiplier * pixel_count
+    cdef size_t queue_size_at_guard = 0
     cdef bint report_needed = False
+    cdef bint queue_guard_exceeded = False
 
     cdef DistPriorityQueueType dist_queue
     cdef ValuePixelType pixel
@@ -241,10 +253,24 @@ def find_mask_reach(
                     pixel.i = i_n
                     pixel.j = j_n
                     dist_queue.push(pixel)
+                    queue_size = dist_queue.size()
+                    if queue_size > queue_guard_limit:
+                        queue_size_at_guard = queue_size
+                        queue_guard_exceeded = True
+                        break
+
+                if queue_guard_exceeded:
+                    break
 
                 if report_needed:
                     queue_size = dist_queue.size()
                     break
+        if queue_guard_exceeded:
+            raise MemoryError(
+                "travel reach priority queue exceeded guard limit: "
+                f"queue={queue_size_at_guard}, limit={queue_guard_limit}, "
+                f"raster={n_cols}x{n_rows} px, pops={pop_count}, "
+                f"covered={covered_count} px, max_time={max_time:.1f} min")
         if report_needed:
             LOGGER.info(
                 "travel reach heartbeat: frontier=%.1f/%.1f min "
