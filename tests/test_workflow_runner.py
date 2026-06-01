@@ -208,6 +208,59 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
             np.array([[1, 1], [0, 0]], dtype=np.uint8),
         )
 
+    def test_windowed_travel_reach_matches_whole_raster_reach(self):
+        profile = {
+            "driver": "GTiff",
+            "height": 6,
+            "width": 6,
+            "count": 1,
+            "dtype": "float32",
+            "crs": "EPSG:3857",
+            "transform": from_origin(0, 6, 1, 1),
+            "nodata": 0,
+        }
+        mask_profile = {**profile, "dtype": "uint8"}
+        workflow_runner._set_tiled_geotiff_creation_options(profile)
+        workflow_runner._set_tiled_geotiff_creation_options(mask_profile)
+
+        friction = np.ones((6, 6), dtype=np.float32)
+        source_mask = np.zeros((6, 6), dtype=np.int8)
+        source_mask[1, 1] = 1
+        source_mask[4, 4] = 1
+        expected = workflow_runner.shortest_distances.find_mask_reach(
+            friction,
+            source_mask,
+            1.0,
+            6,
+            6,
+            1.5,
+            progress_interval_seconds=0,
+        )
+
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            friction_path = workspace_path / "friction.tif"
+            mask_path = workspace_path / "mask.tif"
+            coverage_path = workspace_path / "coverage.tif"
+            with rasterio.open(friction_path, "w", **profile) as friction_raster:
+                friction_raster.write(friction, 1)
+            with rasterio.open(mask_path, "w", **mask_profile) as mask_raster:
+                mask_raster.write(source_mask.astype(np.uint8), 1)
+
+            workflow_runner.calculate_windowed_travel_reach(
+                friction_path,
+                mask_path,
+                coverage_path,
+                max_time_mins=1.5,
+                buffer_pixels=2,
+                core_block_size=2,
+            )
+
+            with rasterio.open(coverage_path) as coverage_raster:
+                result = coverage_raster.read(1)
+
+        np.testing.assert_array_equal(result, expected)
+
     def test_mask_population_with_coverage_applies_coverage_once(self):
         transform = from_origin(0, 2, 1, 1)
         coverage_profile = {
