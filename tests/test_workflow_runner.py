@@ -421,6 +421,139 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
         )
         self.assertEqual(population_sum, 40)
 
+    def test_full_extent_includes_travel_time_condition_rasters(self):
+        raster_paths = workflow_runner._raster_paths_for_full_extent(
+            {
+                "inputs": {
+                    "population_raster_path": Path("population.tif"),
+                    "traveltime_raster_path": Path("travel.tif"),
+                    "dem_raster_path": Path("dem.tif"),
+                },
+                "masks": [
+                    {
+                        "type": "travel_time_population",
+                        "params": {
+                            "condition_raster_path": "travel_sources.tif",
+                        },
+                    },
+                    {
+                        "type": "conditional_raster",
+                        "params": {
+                            "condition_raster_path": "downstream_sources.tif",
+                        },
+                    },
+                ],
+            }
+        )
+
+        self.assertIn(Path("travel_sources.tif"), raster_paths)
+        self.assertIn(Path("downstream_sources.tif"), raster_paths)
+
+    def test_travel_time_population_requires_condition_source_params(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            for filename in [
+                "population.tif",
+                "travel.tif",
+                "dem.tif",
+                "subwatersheds.gpkg",
+            ]:
+                (workspace_path / filename).touch()
+            config_path = workspace_path / "missing_travel_source.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "run_name: missing_travel_source",
+                        "work_dir: work",
+                        "output_dir: output",
+                        "inputs:",
+                        "  population_raster_path: "
+                        f"{workspace_path / 'population.tif'}",
+                        "  traveltime_raster_path: "
+                        f"{workspace_path / 'travel.tif'}",
+                        f"  dem_raster_path: {workspace_path / 'dem.tif'}",
+                        "  subwatershed_vector_path: "
+                        f"{workspace_path / 'subwatersheds.gpkg'}",
+                        "  analyze_full_raster_extent: true",
+                        "  wgs84_pixel_size: 1",
+                        "  travel_time_pixel_size_m: 1000",
+                        "  buffer_size_m: 5000",
+                        "sections:",
+                        "  - masks:",
+                        "    - id: within_travel_time",
+                        "      type: travel_time_population",
+                        "      params:",
+                        "        max_hours: 1",
+                        "  - combine:",
+                        "    - logic: OR",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "condition_raster_path, expression",
+            ):
+                workflow_runner.process_config(config_path)
+
+    def test_travel_time_source_mask_uses_condition_raster_and_drain_mask(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            condition_path = workspace_path / "hotspots.tif"
+            reference_path = workspace_path / "friction_clip.tif"
+            vector_path = workspace_path / "drain.gpkg"
+            target_path = workspace_path / "source_mask.tif"
+
+            reference_info = {
+                "pixel_size": (900, -900),
+                "bounding_box": [0, 0, 1800, 1800],
+                "projection_wkt": "PROJCS[...]",
+            }
+            condition_info = {
+                "datatype": workflow_runner.gdal.GDT_Float32,
+                "nodata": [-9999],
+            }
+
+            with mock.patch(
+                "workflow_runner.geoprocessing.get_raster_info",
+                side_effect=[reference_info, condition_info],
+            ), mock.patch(
+                "workflow_runner.geoprocessing.warp_raster"
+            ) as warp_raster, mock.patch(
+                "workflow_runner.geoprocessing.raster_calculator"
+            ) as raster_calculator:
+                result_path = workflow_runner.create_travel_time_source_mask(
+                    condition_path,
+                    "value > 0",
+                    vector_path,
+                    reference_path,
+                    workspace_path,
+                    target_path,
+                )
+
+            self.assertEqual(result_path, target_path)
+            warp_raster.assert_called_once()
+            warp_args, warp_kwargs = warp_raster.call_args
+            self.assertEqual(warp_args[0], str(condition_path))
+            self.assertEqual(warp_args[1], reference_info["pixel_size"])
+            self.assertEqual(warp_kwargs["target_bb"], reference_info["bounding_box"])
+            self.assertEqual(
+                warp_kwargs["target_projection_wkt"],
+                reference_info["projection_wkt"],
+            )
+            self.assertEqual(
+                warp_kwargs["vector_mask_options"],
+                {"mask_vector_path": str(vector_path)},
+            )
+
+            raster_calculator.assert_called_once()
+            calc_args, calc_kwargs = raster_calculator.call_args
+            self.assertEqual(calc_args[2], str(target_path))
+            self.assertEqual(calc_args[3], workflow_runner.gdal.GDT_Byte)
+            self.assertEqual(calc_args[4], 0)
+            self.assertFalse(calc_kwargs["calc_raster_stats"])
+
 
 if __name__ == "__main__":
     unittest.main()
