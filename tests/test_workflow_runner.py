@@ -1,5 +1,6 @@
 import unittest
 import warnings
+from unittest import mock
 from pathlib import Path
 import tempfile
 
@@ -14,6 +15,37 @@ import workflow_runner
 
 
 class Wgs84BoundsMaskTests(unittest.TestCase):
+
+    def test_conditional_workflows_default_to_two_workers(self):
+        config = {
+            "inputs": {"taskgraph_workers": None},
+            "masks": [
+                {"type": "travel_time_population"},
+                {"type": "conditional_raster"},
+            ],
+        }
+
+        with mock.patch("workflow_runner.psutil.cpu_count", return_value=16):
+            worker_count = workflow_runner.calculate_taskgraph_worker_count(
+                config,
+                work_unit_count=5421,
+            )
+
+        self.assertEqual(worker_count, 2)
+
+    def test_configured_taskgraph_workers_override_default_and_cap_at_cpu_count(self):
+        config = {
+            "inputs": {"taskgraph_workers": 99},
+            "masks": [{"type": "conditional_raster"}],
+        }
+
+        with mock.patch("workflow_runner.psutil.cpu_count", return_value=16):
+            worker_count = workflow_runner.calculate_taskgraph_worker_count(
+                config,
+                work_unit_count=5421,
+            )
+
+        self.assertEqual(worker_count, 16)
 
     def test_is_eckert_iv_crs_detects_projection_without_proj4_warning(self):
         eckert_crs = CRS.from_proj4("+proj=eck4 +R=6371000 +units=m +no_defs")

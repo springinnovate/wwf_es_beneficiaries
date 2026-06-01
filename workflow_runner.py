@@ -60,6 +60,9 @@ import shortest_distances
 
 RASTER_BLOCK_SIZE = 256
 HEARTBEAT_INTERVAL_SECONDS = 60
+DEFAULT_GDAL_CACHEMAX_MB = 128
+DEFAULT_CONDITIONAL_TASKGRAPH_WORKERS = 2
+DEFAULT_TRAVEL_TIME_TASKGRAPH_WORKERS = 4
 TRAVEL_TIME_MAX_DISTANCE_M_PER_HOUR = 104_000
 POPULATION_COMBINE_VRT_NODATA = -1
 DISTANCE_TRANSFORM_NODATA = -1
@@ -73,6 +76,56 @@ GTIFF_CREATION_OPTIONS = (
     "NUM_THREADS=ALL_CPUS",
 )
 GTIFF_CREATION_TUPLE = ("GTIFF", GTIFF_CREATION_OPTIONS)
+
+
+def _format_bytes(size_bytes: int | float) -> str:
+    """Return a compact human-readable byte size."""
+    size = float(size_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(size) < 1024 or unit == "TiB":
+            return f"{size:.1f}{unit}"
+        size /= 1024
+
+
+def configure_gdal_cache(cachemax_mb: int | None = None) -> int:
+    """Set GDAL's per-process cache limit and return it in MiB."""
+    if cachemax_mb is None:
+        cachemax_mb = int(os.environ.get("GDAL_CACHEMAX", DEFAULT_GDAL_CACHEMAX_MB))
+    cachemax_mb = int(cachemax_mb)
+    os.environ["GDAL_CACHEMAX"] = str(cachemax_mb)
+    cachemax_bytes = cachemax_mb * 1024 * 1024
+    if hasattr(gdal, "SetCacheMax64"):
+        gdal.SetCacheMax64(cachemax_bytes)
+    else:
+        gdal.SetCacheMax(cachemax_bytes)
+    return cachemax_mb
+
+
+def _process_tree_rss_bytes() -> int:
+    """Return RSS for this process and any living child processes."""
+    total = 0
+    process_list = [psutil.Process(os.getpid())]
+    try:
+        process_list.extend(process_list[0].children(recursive=True))
+    except psutil.Error:
+        pass
+    for process in process_list:
+        try:
+            total += process.memory_info().rss
+        except psutil.Error:
+            continue
+    return total
+
+
+def _memory_status_text() -> str:
+    """Return current system and workflow memory use for heartbeat logs."""
+    virtual_memory = psutil.virtual_memory()
+    return (
+        "memory: "
+        f"available={_format_bytes(virtual_memory.available)}, "
+        f"used={virtual_memory.percent:.1f}%, "
+        f"workflow_rss={_format_bytes(_process_tree_rss_bytes())}"
+    )
 
 
 def _set_tiled_geotiff_creation_options(raster_meta: dict) -> None:
@@ -328,6 +381,8 @@ def process_config(config_path: Path) -> Dict[str, Any]:
                 - 'aoi_vector_pattern' (list[str])
                 - 'analyze_full_raster_extent' (bool)
                 - 'debug_drain_index' (int | None)
+                - 'taskgraph_workers' (int | None)
+                - 'gdal_cachemax_mb' (int)
             - 'masks' (list[dict]): Each item has 'id' (str), 'type' (str),
               and 'params' (dict).
             - 'combine' (list[dict]): As provided in the YAML 'combine'
@@ -398,6 +453,33 @@ def process_config(config_path: Path) -> Dict[str, Any]:
                 "`inputs.debug_drain_index` must be a non-negative integer, "
                 f"got {debug_drain_index}"
             )
+
+    taskgraph_workers = inputs.get("taskgraph_workers", None)
+    if taskgraph_workers is not None:
+        if isinstance(taskgraph_workers, bool) or not isinstance(
+            taskgraph_workers, int
+        ):
+            raise ValueError(
+                "`inputs.taskgraph_workers` must be a positive integer, "
+                f"got {taskgraph_workers!r}"
+            )
+        if taskgraph_workers < 1:
+            raise ValueError(
+                "`inputs.taskgraph_workers` must be a positive integer, "
+                f"got {taskgraph_workers}"
+            )
+
+    gdal_cachemax_mb = inputs.get("gdal_cachemax_mb", DEFAULT_GDAL_CACHEMAX_MB)
+    if isinstance(gdal_cachemax_mb, bool) or not isinstance(gdal_cachemax_mb, int):
+        raise ValueError(
+            "`inputs.gdal_cachemax_mb` must be a positive integer, "
+            f"got {gdal_cachemax_mb!r}"
+        )
+    if gdal_cachemax_mb < 1:
+        raise ValueError(
+            "`inputs.gdal_cachemax_mb` must be a positive integer, "
+            f"got {gdal_cachemax_mb}"
+        )
 
     wgs84_pixel_size = inputs.get("wgs84_pixel_size", None)
     travel_time_pixel_size_m = inputs.get("travel_time_pixel_size_m", None)
@@ -535,6 +617,8 @@ def process_config(config_path: Path) -> Dict[str, Any]:
             "aoi_vector_pattern": aoi_vector_pattern,
             "analyze_full_raster_extent": analyze_full_raster_extent,
             "debug_drain_index": debug_drain_index,
+            "taskgraph_workers": taskgraph_workers,
+            "gdal_cachemax_mb": gdal_cachemax_mb,
             "wgs84_pixel_size": float(wgs84_pixel_size),
             "travel_time_pixel_size_m": float(travel_time_pixel_size_m),
             "buffer_size_m": float(buffer_size_m),
@@ -1418,6 +1502,7 @@ def calculate_travel_time_coverage(
     Returns:
         Path: ``target_coverage_raster_path``.
     """
+    configure_gdal_cache()
     logger = logging.getLogger(__name__)
     max_time_mins = max_hours * 60
     working_dir = Path(working_dir)
@@ -1642,6 +1727,7 @@ def calculate_downstream_coverage_from_conditional_raster(
     Returns:
         Path: ``target_coverage_raster_path``.
     """
+    configure_gdal_cache()
     logger = logging.getLogger(__name__)
     logger.debug(f"max downstream distance: {max_downstream_distance_m}")
     condition_raster_path = working_dir / f"mask_{condition_id}_{base_raster_path.name}"
@@ -1758,6 +1844,7 @@ def calculate_downstream_coverage_from_conditional_raster(
 
 
 def calc_flow_dir(dem_path, working_dir, target_flow_dir_raster_path):
+    configure_gdal_cache()
     pit_filled_raster_path = working_dir / f"pit_filled_{Path(dem_path).name}"
     routing.fill_pits(
         (dem_path, 1),
@@ -2185,18 +2272,36 @@ def calculate_taskgraph_worker_count(config: dict, work_unit_count: int) -> int:
             units that will be processed.
 
     Returns:
-        Worker count bounded by the physical CPU count. The value is at least
-        one and adds two extra slots when travel-time work can run alongside
-        AOI downstream preparation.
+        Worker count bounded by the physical CPU count. Conditional routing
+        workflows default to a conservative worker count because DEM routing
+        and raster warping are memory-heavy.
     """
     physical_cpu_count = psutil.cpu_count(logical=False) or psutil.cpu_count() or 1
+    configured_workers = config.get("inputs", {}).get("taskgraph_workers")
+    if configured_workers is not None:
+        return min(int(configured_workers), physical_cpu_count)
+
     has_travel_time_mask = any(
         mask.get("type") == "travel_time_population" for mask in config.get("masks", [])
     )
+    has_conditional_mask = any(
+        mask.get("type") == "conditional_raster" for mask in config.get("masks", [])
+    )
 
-    desired_worker_count = max(1, work_unit_count)
+    if has_conditional_mask:
+        desired_worker_count = min(
+            DEFAULT_CONDITIONAL_TASKGRAPH_WORKERS,
+            max(1, work_unit_count),
+        )
+    elif has_travel_time_mask:
+        desired_worker_count = min(
+            DEFAULT_TRAVEL_TIME_TASKGRAPH_WORKERS,
+            max(1, work_unit_count),
+        )
+    else:
+        desired_worker_count = max(1, work_unit_count)
     if has_travel_time_mask:
-        desired_worker_count += 2
+        desired_worker_count = max(2, desired_worker_count)
     return min(desired_worker_count, physical_cpu_count)
 
 
@@ -2217,6 +2322,8 @@ def main() -> None:
     output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_logger(config["logging"]["level"], config["logging"]["to_file"])
+    gdal_cachemax_mb = configure_gdal_cache(config["inputs"]["gdal_cachemax_mb"])
+    logger.info("using GDAL cache max of %d MiB per process", gdal_cachemax_mb)
 
     validate_paths(config)
     logger.info(f"{args.config} read successfully")
@@ -2285,6 +2392,7 @@ def main() -> None:
     union_population_id = "union_population"
     population_result_ids.add(union_population_id)
     population_results = collections.defaultdict(dict)
+    task_progress_paths = []
     for aoi_key, aoi_info in aoi_work_items.items():
         aoi_vector_path = aoi_info["aoi_vector_path"]
         working_dir = aoi_info["working_dir"]
@@ -2358,6 +2466,7 @@ def main() -> None:
                     partition_coverage_raster_path = (
                         partition_context["working_dir"] / f"{section_id}_coverage.tif"
                     )
+                    task_progress_paths.append(partition_coverage_raster_path)
                     partition_coverage_id_raster_list.append(
                         (partition_id, partition_coverage_raster_path)
                     )
@@ -2400,6 +2509,7 @@ def main() -> None:
                     partition_coverage_raster_path = (
                         partition_context["working_dir"] / f"{section_id}_coverage.tif"
                     )
+                    task_progress_paths.append(partition_coverage_raster_path)
                     partition_coverage_id_raster_list.append(
                         (partition_id, partition_coverage_raster_path)
                     )
@@ -2443,6 +2553,7 @@ def main() -> None:
                 task_name=f"stitch coverage for {aoi_key} {section_id}",
             )
             coverage_raster_tasks[section_id] = section_coverage_task
+            task_progress_paths.append(target_coverage_raster_path)
             coverage_id_raster_list.append((section_id, target_coverage_raster_path))
 
             target_population_raster_path = (
@@ -2461,8 +2572,10 @@ def main() -> None:
                 task_name=f"mask population for {aoi_key} {section_id}",
             )
             population_results[aoi_key][f"{section_id}_population"] = population_task
+            task_progress_paths.append(target_population_raster_path)
 
         target_union_coverage_raster_path = output_dir / f"{aoi_key}_union_coverage.tif"
+        task_progress_paths.append(target_union_coverage_raster_path)
         union_coverage_task = task_graph.add_task(
             func=stitch_coverage_masks,
             args=(
@@ -2492,9 +2605,25 @@ def main() -> None:
             task_name=f"mask population for {aoi_key} union",
         )
         population_results[aoi_key][union_population_id] = union_population_task
+        task_progress_paths.append(target_union_population_raster_path)
 
     task_graph.close()
-    task_graph.join()
+    def _task_progress_message() -> str:
+        complete_count = 0
+        for target_path in task_progress_paths:
+            try:
+                if Path(target_path).exists() and Path(target_path).stat().st_size > 0:
+                    complete_count += 1
+            except OSError:
+                pass
+        return (
+            "workflow tasks running: "
+            f"{complete_count}/{len(task_progress_paths)} target rasters present; "
+            f"{_memory_status_text()}"
+        )
+
+    with _log_heartbeat(logger, _task_progress_message):
+        task_graph.join()
     rows = []
     for aoi_key, results in population_results.items():
         row = {"aoi": aoi_key}
