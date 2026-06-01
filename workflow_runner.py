@@ -60,6 +60,9 @@ import shortest_distances
 
 RASTER_BLOCK_SIZE = 256
 HEARTBEAT_INTERVAL_SECONDS = 60
+DEFAULT_GDAL_CACHEMAX_MB = 128
+DEFAULT_CONDITIONAL_TASKGRAPH_WORKERS = 2
+DEFAULT_TRAVEL_TIME_TASKGRAPH_WORKERS = 4
 TRAVEL_TIME_MAX_DISTANCE_M_PER_HOUR = 104_000
 TRAVEL_TIME_MAX_WINDOW_BYTES = 2 * 1024**3
 POPULATION_COMBINE_VRT_NODATA = -1
@@ -74,6 +77,76 @@ GTIFF_CREATION_OPTIONS = (
     "NUM_THREADS=ALL_CPUS",
 )
 GTIFF_CREATION_TUPLE = ("GTIFF", GTIFF_CREATION_OPTIONS)
+
+
+def _format_bytes(size_bytes: int | float) -> str:
+    """Return a compact human-readable byte size."""
+    size = float(size_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(size) < 1024 or unit == "TiB":
+            return f"{size:.1f}{unit}"
+        size /= 1024
+
+
+def configure_gdal_cache(cachemax_mb: int | None = None) -> int:
+    """Set GDAL's per-process cache limit and return it in MiB."""
+    if cachemax_mb is None:
+        cachemax_mb = int(os.environ.get("GDAL_CACHEMAX", DEFAULT_GDAL_CACHEMAX_MB))
+    cachemax_mb = int(cachemax_mb)
+    os.environ["GDAL_CACHEMAX"] = str(cachemax_mb)
+    cachemax_bytes = cachemax_mb * 1024 * 1024
+    if hasattr(gdal, "SetCacheMax64"):
+        gdal.SetCacheMax64(cachemax_bytes)
+    else:
+        gdal.SetCacheMax(cachemax_bytes)
+    return cachemax_mb
+
+
+def _process_tree_rss_bytes() -> int:
+    """Return RSS for this process and any living child processes."""
+    total = 0
+    process_list = [psutil.Process(os.getpid())]
+    try:
+        process_list.extend(process_list[0].children(recursive=True))
+    except psutil.Error:
+        pass
+    for process in process_list:
+        try:
+            total += process.memory_info().rss
+        except psutil.Error:
+            continue
+    return total
+
+
+def _memory_status_text() -> str:
+    """Return current system and workflow memory use for heartbeat logs."""
+    virtual_memory = psutil.virtual_memory()
+    return (
+        "memory: "
+        f"available={_format_bytes(virtual_memory.available)}, "
+        f"used={virtual_memory.percent:.1f}%, "
+        f"workflow_rss={_format_bytes(_process_tree_rss_bytes())}"
+    )
+
+
+@contextlib.contextmanager
+def _log_memory_scope(logger: logging.Logger, label: str):
+    """Log process-tree memory before and after a diagnostic scope."""
+    start_time = time.monotonic()
+    start_rss = _process_tree_rss_bytes()
+    logger.info("%s started; %s", label, _memory_status_text())
+    try:
+        yield
+    finally:
+        end_rss = _process_tree_rss_bytes()
+        elapsed_seconds = time.monotonic() - start_time
+        logger.info(
+            "%s finished in %.1fs; rss_delta=%s; %s",
+            label,
+            elapsed_seconds,
+            _format_bytes(end_rss - start_rss),
+            _memory_status_text(),
+        )
 
 
 def _set_tiled_geotiff_creation_options(raster_meta: dict) -> None:
@@ -329,6 +402,8 @@ def process_config(config_path: Path) -> Dict[str, Any]:
                 - 'aoi_vector_pattern' (list[str])
                 - 'analyze_full_raster_extent' (bool)
                 - 'debug_drain_index' (int | None)
+                - 'taskgraph_workers' (int | None)
+                - 'gdal_cachemax_mb' (int)
             - 'masks' (list[dict]): Each item has 'id' (str), 'type' (str),
               and 'params' (dict).
             - 'combine' (list[dict]): As provided in the YAML 'combine'
@@ -399,6 +474,33 @@ def process_config(config_path: Path) -> Dict[str, Any]:
                 "`inputs.debug_drain_index` must be a non-negative integer, "
                 f"got {debug_drain_index}"
             )
+
+    taskgraph_workers = inputs.get("taskgraph_workers", None)
+    if taskgraph_workers is not None:
+        if isinstance(taskgraph_workers, bool) or not isinstance(
+            taskgraph_workers, int
+        ):
+            raise ValueError(
+                "`inputs.taskgraph_workers` must be a positive integer, "
+                f"got {taskgraph_workers!r}"
+            )
+        if taskgraph_workers < 1:
+            raise ValueError(
+                "`inputs.taskgraph_workers` must be a positive integer, "
+                f"got {taskgraph_workers}"
+            )
+
+    gdal_cachemax_mb = inputs.get("gdal_cachemax_mb", DEFAULT_GDAL_CACHEMAX_MB)
+    if isinstance(gdal_cachemax_mb, bool) or not isinstance(gdal_cachemax_mb, int):
+        raise ValueError(
+            "`inputs.gdal_cachemax_mb` must be a positive integer, "
+            f"got {gdal_cachemax_mb!r}"
+        )
+    if gdal_cachemax_mb < 1:
+        raise ValueError(
+            "`inputs.gdal_cachemax_mb` must be a positive integer, "
+            f"got {gdal_cachemax_mb}"
+        )
 
     wgs84_pixel_size = inputs.get("wgs84_pixel_size", None)
     travel_time_pixel_size_m = inputs.get("travel_time_pixel_size_m", None)
@@ -536,6 +638,8 @@ def process_config(config_path: Path) -> Dict[str, Any]:
             "aoi_vector_pattern": aoi_vector_pattern,
             "analyze_full_raster_extent": analyze_full_raster_extent,
             "debug_drain_index": debug_drain_index,
+            "taskgraph_workers": taskgraph_workers,
+            "gdal_cachemax_mb": gdal_cachemax_mb,
             "wgs84_pixel_size": float(wgs84_pixel_size),
             "travel_time_pixel_size_m": float(travel_time_pixel_size_m),
             "buffer_size_m": float(buffer_size_m),
@@ -1266,7 +1370,10 @@ def mask_raster_to_vector(raster_path: str | Path, vector_path: str | Path) -> N
         if not geometries:
             raise ValueError(f"No valid geometries found in {vector_path}.")
 
-        outside_value = raster.nodata if raster.nodata is not None else 0
+        outside_value = raster.nodata
+        if outside_value is None:
+            outside_value = _default_nodata_for_dtype(raster.dtypes[0])
+            raster.nodata = outside_value
         for _, window in raster.block_windows(1):
             block = raster.read(1, window=window)
             inside_mask = rasterio.features.geometry_mask(
@@ -1277,6 +1384,19 @@ def mask_raster_to_vector(raster_path: str | Path, vector_path: str | Path) -> N
             )
             block[~inside_mask] = outside_value
             raster.write(block, 1, window=window)
+
+
+def _default_nodata_for_dtype(dtype) -> int | float:
+    """Return a dtype-safe nodata value for rasters that do not define one."""
+    dtype = np.dtype(dtype)
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        if np.issubdtype(dtype, np.signedinteger):
+            return int(info.min)
+        return int(info.max)
+    if np.issubdtype(dtype, np.floating):
+        return float(-np.finfo(dtype).max)
+    raise ValueError(f"No default nodata value is defined for dtype {dtype}")
 
 
 def eck4_limits(r=6371000):
@@ -1519,7 +1639,7 @@ def calculate_windowed_travel_reach(
                     desc=progress_label or f"travel windows {target_coverage_raster_path.stem}",
                     unit="window",
                 )
-                for core_window in progress:
+                for window_index, core_window in enumerate(progress, start=1):
                     core_mask = source_mask.read(1, window=core_window)
                     if not np.any(core_mask == 1):
                         skipped_windows += 1
@@ -1560,15 +1680,24 @@ def calculate_windowed_travel_reach(
                     ).astype(np.int8)
 
                     n_rows, n_cols = friction_array.shape
-                    reach_array = shortest_distances.find_mask_reach(
-                        friction_array,
-                        source_array,
-                        cell_length_m,
-                        n_cols,
-                        n_rows,
-                        max_time_mins,
-                        progress_interval_seconds=0,
+                    reach_label = (
+                        "find_mask_reach "
+                        f"{target_coverage_raster_path.stem} "
+                        f"window={window_index}/{total_windows} "
+                        f"core={int(core_window.width)}x{int(core_window.height)} "
+                        f"buffered={n_cols}x{n_rows} "
+                        f"estimated_arrays={_format_bytes(estimated_bytes)}"
                     )
+                    with _log_memory_scope(logger, reach_label):
+                        reach_array = shortest_distances.find_mask_reach(
+                            friction_array,
+                            source_array,
+                            cell_length_m,
+                            n_cols,
+                            n_rows,
+                            max_time_mins,
+                            progress_interval_seconds=0,
+                        )
 
                     existing_array = target.read(1, window=buffered_window)
                     np.maximum(existing_array, reach_array, out=existing_array)
@@ -1614,7 +1743,12 @@ def calculate_travel_time_coverage(
     Returns:
         Path: ``target_coverage_raster_path``.
     """
+    configure_gdal_cache()
     logger = logging.getLogger(__name__)
+    worker_label = f"travel-time coverage worker {Path(aoi_vector_path).stem}"
+    worker_start_time = time.monotonic()
+    worker_start_rss = _process_tree_rss_bytes()
+    logger.info("%s started; %s", worker_label, _memory_status_text())
     max_time_mins = max_hours * 60
     working_dir = Path(working_dir)
     working_dir.mkdir(parents=True, exist_ok=True)
@@ -1695,7 +1829,7 @@ def calculate_travel_time_coverage(
         wgs84_bounds=aoi_wgs84_bounds,
     )
 
-    return calculate_windowed_travel_reach(
+    result_path = calculate_windowed_travel_reach(
         target_friction_clipped_raster_path,
         target_aoi_raster_path,
         target_coverage_raster_path,
@@ -1703,6 +1837,14 @@ def calculate_travel_time_coverage(
         buffer_pixels,
         progress_label=f"travel windows {Path(aoi_vector_path).stem}",
     )
+    logger.info(
+        "%s finished in %.1fs; rss_delta=%s; %s",
+        worker_label,
+        time.monotonic() - worker_start_time,
+        _format_bytes(_process_tree_rss_bytes() - worker_start_rss),
+        _memory_status_text(),
+    )
+    return result_path
 
 
 def create_distance_transform(
@@ -1842,7 +1984,12 @@ def calculate_downstream_coverage_from_conditional_raster(
     Returns:
         Path: ``target_coverage_raster_path``.
     """
+    configure_gdal_cache()
     logger = logging.getLogger(__name__)
+    worker_label = f"downstream coverage worker {condition_id} {Path(aoi_vector_path).stem}"
+    worker_start_time = time.monotonic()
+    worker_start_rss = _process_tree_rss_bytes()
+    logger.info("%s started; %s", worker_label, _memory_status_text())
     logger.debug(f"max downstream distance: {max_downstream_distance_m}")
     condition_raster_path = working_dir / f"mask_{condition_id}_{base_raster_path.name}"
 
@@ -1954,10 +2101,23 @@ def calculate_downstream_coverage_from_conditional_raster(
         calc_raster_stats=False,
         raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
     )
+    logger.info(
+        "%s finished in %.1fs; rss_delta=%s; %s",
+        worker_label,
+        time.monotonic() - worker_start_time,
+        _format_bytes(_process_tree_rss_bytes() - worker_start_rss),
+        _memory_status_text(),
+    )
     return target_coverage_raster_path
 
 
 def calc_flow_dir(dem_path, working_dir, target_flow_dir_raster_path):
+    configure_gdal_cache()
+    logger = logging.getLogger(__name__)
+    worker_label = f"flow direction worker {Path(target_flow_dir_raster_path).stem}"
+    worker_start_time = time.monotonic()
+    worker_start_rss = _process_tree_rss_bytes()
+    logger.info("%s started; %s", worker_label, _memory_status_text())
     pit_filled_raster_path = working_dir / f"pit_filled_{Path(dem_path).name}"
     routing.fill_pits(
         (dem_path, 1),
@@ -1970,6 +2130,13 @@ def calc_flow_dir(dem_path, working_dir, target_flow_dir_raster_path):
         str(target_flow_dir_raster_path),
         working_dir=str(working_dir),
         raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
+    )
+    logger.info(
+        "%s finished in %.1fs; rss_delta=%s; %s",
+        worker_label,
+        time.monotonic() - worker_start_time,
+        _format_bytes(_process_tree_rss_bytes() - worker_start_rss),
+        _memory_status_text(),
     )
 
 
@@ -1995,6 +2162,45 @@ def _raster_bounds_in_crs(raster: rasterio.DatasetReader, target_crs) -> tuple:
         *raster.bounds,
         densify_pts=21,
     )
+
+
+def _split_wgs84_antimeridian_bounds(bounds: tuple) -> list[tuple]:
+    """Clip WGS84 bounds into non-wrapping longitude intervals.
+
+    Raster bounds transformed to WGS84 can wrap across the antimeridian, for
+    example ``(167, bottom, -179, top)``. Rasterio window calculations expect
+    left <= right, so split wrapped bounds into east and west pieces clipped to
+    the valid longitude range.
+    """
+    left, bottom, right, top = bounds
+    left = max(-180.0, min(180.0, left))
+    right = max(-180.0, min(180.0, right))
+    bottom = max(-90.0, min(90.0, bottom))
+    top = max(-90.0, min(90.0, top))
+
+    if bottom >= top:
+        return []
+    if left <= right:
+        if left == right:
+            return []
+        return [(left, bottom, right, top)]
+
+    split_bounds = []
+    if left < 180.0:
+        split_bounds.append((left, bottom, 180.0, top))
+    if right > -180.0:
+        split_bounds.append((-180.0, bottom, right, top))
+    return split_bounds
+
+
+def _floor_to_grid(value: float, pixel_size: float) -> float:
+    """Floor ``value`` to a grid while tolerating tiny floating-point drift."""
+    return math.floor(value / pixel_size + 1e-9) * pixel_size
+
+
+def _ceil_to_grid(value: float, pixel_size: float) -> float:
+    """Ceil ``value`` to a grid while tolerating tiny floating-point drift."""
+    return math.ceil(value / pixel_size - 1e-9) * pixel_size
 
 
 def _combined_raster_profile(
@@ -2031,19 +2237,22 @@ def _combined_raster_profile(
 
     for raster_path in raster_path_list:
         with rasterio.open(raster_path) as raster:
-            left, bottom, right, top = _raster_bounds_in_crs(raster, target_crs)
-        minx = min(minx, left)
-        miny = min(miny, bottom)
-        maxx = max(maxx, right)
-        maxy = max(maxy, top)
+            raster_bounds = _raster_bounds_in_crs(raster, target_crs)
+        for left, bottom, right, top in _split_wgs84_antimeridian_bounds(
+            raster_bounds
+        ):
+            minx = min(minx, left)
+            miny = min(miny, bottom)
+            maxx = max(maxx, right)
+            maxy = max(maxy, top)
 
     if not all(math.isfinite(value) for value in [minx, miny, maxx, maxy]):
         raise ValueError("No valid raster bounds were found for population combine.")
 
-    minx = math.floor(minx / pixel_size) * pixel_size
-    miny = math.floor(miny / pixel_size) * pixel_size
-    maxx = math.ceil(maxx / pixel_size) * pixel_size
-    maxy = math.ceil(maxy / pixel_size) * pixel_size
+    minx = _floor_to_grid(minx, pixel_size)
+    miny = _floor_to_grid(miny, pixel_size)
+    maxx = _ceil_to_grid(maxx, pixel_size)
+    maxy = _ceil_to_grid(maxy, pixel_size)
 
     width = int(math.ceil((maxx - minx) / pixel_size))
     height = int(math.ceil((maxy - miny) / pixel_size))
@@ -2252,12 +2461,10 @@ def stitch_coverage_masks(
                     source_count = np.float64(0)
                     with rasterio.open(source_path) as source:
                         source_bounds = _raster_bounds_in_crs(source, target_crs)
-                        target_window = _integer_window(
-                            from_bounds(*source_bounds, transform=target_transform),
-                            target.width,
-                            target.height,
+                        source_bounds_list = _split_wgs84_antimeridian_bounds(
+                            source_bounds
                         )
-                        if target_window.width == 0 or target_window.height == 0:
+                        if not source_bounds_list:
                             coverage_counts_by_id[coverage_id] = source_count
                             continue
 
@@ -2273,18 +2480,33 @@ def stitch_coverage_masks(
                             vrt_kwargs["src_nodata"] = source.nodata
 
                         with WarpedVRT(source, **vrt_kwargs) as source_vrt:
-                            for window in _iter_block_windows(target_window):
-                                incoming = source_vrt.read(1, window=window)
-                                incoming = (incoming > 0).astype(np.uint8)
-                                stitch_state["pixels"] += int(
-                                    window.width * window.height
+                            for bounds_part in source_bounds_list:
+                                target_window = _integer_window(
+                                    from_bounds(
+                                        *bounds_part,
+                                        transform=target_transform,
+                                    ),
+                                    target.width,
+                                    target.height,
                                 )
-                                source_count += np.sum(incoming, dtype=np.float64)
-                                if not np.any(incoming):
+                                if (
+                                    target_window.width == 0
+                                    or target_window.height == 0
+                                ):
                                     continue
-                                existing = target.read(1, window=window)
-                                np.maximum(existing, incoming, out=existing)
-                                target.write(existing, 1, window=window)
+
+                                for window in _iter_block_windows(target_window):
+                                    incoming = source_vrt.read(1, window=window)
+                                    incoming = (incoming > 0).astype(np.uint8)
+                                    stitch_state["pixels"] += int(
+                                        window.width * window.height
+                                    )
+                                    source_count += np.sum(incoming, dtype=np.float64)
+                                    if not np.any(incoming):
+                                        continue
+                                    existing = target.read(1, window=window)
+                                    np.maximum(existing, incoming, out=existing)
+                                    target.write(existing, 1, window=window)
 
                     coverage_counts_by_id[coverage_id] = source_count
                     stitch_state["index"] = raster_index
@@ -2390,18 +2612,36 @@ def calculate_taskgraph_worker_count(config: dict, work_unit_count: int) -> int:
             units that will be processed.
 
     Returns:
-        Worker count bounded by the physical CPU count. The value is at least
-        one and adds two extra slots when travel-time work can run alongside
-        AOI downstream preparation.
+        Worker count bounded by the physical CPU count. Conditional routing
+        workflows default to a conservative worker count because DEM routing
+        and raster warping are memory-heavy.
     """
     physical_cpu_count = psutil.cpu_count(logical=False) or psutil.cpu_count() or 1
+    configured_workers = config.get("inputs", {}).get("taskgraph_workers")
+    if configured_workers is not None:
+        return min(int(configured_workers), physical_cpu_count)
+
     has_travel_time_mask = any(
         mask.get("type") == "travel_time_population" for mask in config.get("masks", [])
     )
+    has_conditional_mask = any(
+        mask.get("type") == "conditional_raster" for mask in config.get("masks", [])
+    )
 
-    desired_worker_count = max(1, work_unit_count)
+    if has_conditional_mask:
+        desired_worker_count = min(
+            DEFAULT_CONDITIONAL_TASKGRAPH_WORKERS,
+            max(1, work_unit_count),
+        )
+    elif has_travel_time_mask:
+        desired_worker_count = min(
+            DEFAULT_TRAVEL_TIME_TASKGRAPH_WORKERS,
+            max(1, work_unit_count),
+        )
+    else:
+        desired_worker_count = max(1, work_unit_count)
     if has_travel_time_mask:
-        desired_worker_count += 2
+        desired_worker_count = max(2, desired_worker_count)
     return min(desired_worker_count, physical_cpu_count)
 
 
@@ -2422,6 +2662,8 @@ def main() -> None:
     output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_logger(config["logging"]["level"], config["logging"]["to_file"])
+    gdal_cachemax_mb = configure_gdal_cache(config["inputs"]["gdal_cachemax_mb"])
+    logger.info("using GDAL cache max of %d MiB per process", gdal_cachemax_mb)
 
     validate_paths(config)
     logger.info(f"{args.config} read successfully")
@@ -2716,7 +2958,8 @@ def main() -> None:
                 pass
         return (
             "workflow tasks running: "
-            f"{complete_count}/{len(task_progress_paths)} target rasters present"
+            f"{complete_count}/{len(task_progress_paths)} target rasters present; "
+            f"{_memory_status_text()}"
         )
 
     with _log_heartbeat(logger, _task_progress_message):

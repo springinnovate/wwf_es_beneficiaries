@@ -1,12 +1,15 @@
 import unittest
 import warnings
+from unittest import mock
 from pathlib import Path
 import tempfile
 
+import geopandas as gpd
 import numpy as np
 import rasterio
 from pyproj import CRS, Transformer
 from rasterio.transform import from_origin
+from rasterio.windows import from_bounds
 from shapely.geometry import Point, box
 from shapely.ops import transform
 
@@ -14,6 +17,37 @@ import workflow_runner
 
 
 class Wgs84BoundsMaskTests(unittest.TestCase):
+
+    def test_conditional_workflows_default_to_two_workers(self):
+        config = {
+            "inputs": {"taskgraph_workers": None},
+            "masks": [
+                {"type": "travel_time_population"},
+                {"type": "conditional_raster"},
+            ],
+        }
+
+        with mock.patch("workflow_runner.psutil.cpu_count", return_value=16):
+            worker_count = workflow_runner.calculate_taskgraph_worker_count(
+                config,
+                work_unit_count=5421,
+            )
+
+        self.assertEqual(worker_count, 2)
+
+    def test_configured_taskgraph_workers_override_default_and_cap_at_cpu_count(self):
+        config = {
+            "inputs": {"taskgraph_workers": 99},
+            "masks": [{"type": "conditional_raster"}],
+        }
+
+        with mock.patch("workflow_runner.psutil.cpu_count", return_value=16):
+            worker_count = workflow_runner.calculate_taskgraph_worker_count(
+                config,
+                work_unit_count=5421,
+            )
+
+        self.assertEqual(worker_count, 16)
 
     def test_is_eckert_iv_crs_detects_projection_without_proj4_warning(self):
         eckert_crs = CRS.from_proj4("+proj=eck4 +R=6371000 +units=m +no_defs")
@@ -129,6 +163,44 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
         )
         self.assertEqual(mask[0, 0], 1)
 
+    def test_mask_raster_to_vector_sets_default_nodata_outside_geometry(self):
+        raster_profile = {
+            "driver": "GTiff",
+            "height": 4,
+            "width": 4,
+            "count": 1,
+            "dtype": "int16",
+            "crs": "EPSG:4326",
+            "transform": from_origin(0, 4, 1, 1),
+        }
+        workflow_runner._set_tiled_geotiff_creation_options(raster_profile)
+
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            raster_path = workspace_path / "dem.tif"
+            vector_path = workspace_path / "mask.gpkg"
+            raster_array = np.arange(16, dtype=np.int16).reshape((4, 4))
+            raster_array[1, 1] = 0
+            with rasterio.open(raster_path, "w", **raster_profile) as raster:
+                raster.write(raster_array, 1)
+            gpd.GeoDataFrame(
+                geometry=[box(0, 0, 2, 4)],
+                crs="EPSG:4326",
+            ).to_file(vector_path, driver="GPKG")
+
+            workflow_runner.mask_raster_to_vector(raster_path, vector_path)
+
+            with rasterio.open(raster_path) as masked_raster:
+                masked_array = masked_raster.read(1)
+                nodata = masked_raster.nodata
+
+        self.assertEqual(nodata, np.iinfo(np.int16).min)
+        self.assertEqual(masked_array[1, 1], 0)
+        np.testing.assert_array_equal(
+            masked_array[:, 2:],
+            np.full((4, 2), np.iinfo(np.int16).min, dtype=np.int16),
+        )
+
     def test_stitch_coverage_masks_uses_union_semantics(self):
         profile = {
             "driver": "GTiff",
@@ -174,6 +246,37 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
         np.testing.assert_array_equal(
             result,
             np.array([[1, 1], [0, 0]], dtype=np.uint8),
+        )
+
+    def test_antimeridian_bounds_split_into_valid_wgs84_windows(self):
+        bounds = (167.7408, 66.7660, -179.1999, 70.0103)
+
+        split_bounds = workflow_runner._split_wgs84_antimeridian_bounds(bounds)
+
+        self.assertEqual(
+            split_bounds,
+            [
+                (167.7408, 66.7660, 180.0, 70.0103),
+                (-180.0, 66.7660, -179.1999, 70.0103),
+            ],
+        )
+        transform = from_origin(-180, 90, 1, 1)
+        for bounds_part in split_bounds:
+            window = workflow_runner._integer_window(
+                from_bounds(*bounds_part, transform=transform),
+                360,
+                180,
+            )
+            self.assertGreater(window.width, 0)
+            self.assertGreater(window.height, 0)
+        pixel_size = 0.008333333333333
+        self.assertAlmostEqual(
+            workflow_runner._floor_to_grid(-180.0, pixel_size),
+            -180.0,
+        )
+        self.assertAlmostEqual(
+            workflow_runner._ceil_to_grid(180.0, pixel_size),
+            180.0,
         )
 
     def test_windowed_travel_reach_matches_whole_raster_reach(self):
@@ -228,6 +331,45 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
                 result = coverage_raster.read(1)
 
         np.testing.assert_array_equal(result, expected)
+
+    def test_travel_reach_priority_queue_guard_reports_window_context(self):
+        friction = np.ones((3, 3), dtype=np.float32)
+        source_mask = np.zeros((3, 3), dtype=np.int8)
+        source_mask[1, 1] = 1
+
+        with self.assertRaisesRegex(
+            MemoryError,
+            "travel reach priority queue exceeded guard limit",
+        ):
+            workflow_runner.shortest_distances.find_mask_reach(
+                friction,
+                source_mask,
+                1.0,
+                3,
+                3,
+                2.0,
+                progress_interval_seconds=0,
+                queue_guard_multiplier=0,
+            )
+
+    def test_travel_reach_ignores_nan_friction(self):
+        friction = np.ones((3, 3), dtype=np.float32)
+        friction[1, 2] = np.nan
+        source_mask = np.zeros((3, 3), dtype=np.int8)
+        source_mask[1, 1] = 1
+
+        result = workflow_runner.shortest_distances.find_mask_reach(
+            friction,
+            source_mask,
+            1.0,
+            3,
+            3,
+            2.0,
+            progress_interval_seconds=0,
+        )
+
+        self.assertEqual(result[1, 2], 0)
+        self.assertEqual(result[1, 1], 1)
 
     def test_mask_population_with_coverage_applies_coverage_once(self):
         transform = from_origin(0, 2, 1, 1)
