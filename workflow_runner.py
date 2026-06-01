@@ -2148,6 +2148,45 @@ def _raster_bounds_in_crs(raster: rasterio.DatasetReader, target_crs) -> tuple:
     )
 
 
+def _split_wgs84_antimeridian_bounds(bounds: tuple) -> list[tuple]:
+    """Clip WGS84 bounds into non-wrapping longitude intervals.
+
+    Raster bounds transformed to WGS84 can wrap across the antimeridian, for
+    example ``(167, bottom, -179, top)``. Rasterio window calculations expect
+    left <= right, so split wrapped bounds into east and west pieces clipped to
+    the valid longitude range.
+    """
+    left, bottom, right, top = bounds
+    left = max(-180.0, min(180.0, left))
+    right = max(-180.0, min(180.0, right))
+    bottom = max(-90.0, min(90.0, bottom))
+    top = max(-90.0, min(90.0, top))
+
+    if bottom >= top:
+        return []
+    if left <= right:
+        if left == right:
+            return []
+        return [(left, bottom, right, top)]
+
+    split_bounds = []
+    if left < 180.0:
+        split_bounds.append((left, bottom, 180.0, top))
+    if right > -180.0:
+        split_bounds.append((-180.0, bottom, right, top))
+    return split_bounds
+
+
+def _floor_to_grid(value: float, pixel_size: float) -> float:
+    """Floor ``value`` to a grid while tolerating tiny floating-point drift."""
+    return math.floor(value / pixel_size + 1e-9) * pixel_size
+
+
+def _ceil_to_grid(value: float, pixel_size: float) -> float:
+    """Ceil ``value`` to a grid while tolerating tiny floating-point drift."""
+    return math.ceil(value / pixel_size - 1e-9) * pixel_size
+
+
 def _combined_raster_profile(
     raster_path_list: list[str],
     wgs84_pixel_size: float,
@@ -2182,19 +2221,22 @@ def _combined_raster_profile(
 
     for raster_path in raster_path_list:
         with rasterio.open(raster_path) as raster:
-            left, bottom, right, top = _raster_bounds_in_crs(raster, target_crs)
-        minx = min(minx, left)
-        miny = min(miny, bottom)
-        maxx = max(maxx, right)
-        maxy = max(maxy, top)
+            raster_bounds = _raster_bounds_in_crs(raster, target_crs)
+        for left, bottom, right, top in _split_wgs84_antimeridian_bounds(
+            raster_bounds
+        ):
+            minx = min(minx, left)
+            miny = min(miny, bottom)
+            maxx = max(maxx, right)
+            maxy = max(maxy, top)
 
     if not all(math.isfinite(value) for value in [minx, miny, maxx, maxy]):
         raise ValueError("No valid raster bounds were found for population combine.")
 
-    minx = math.floor(minx / pixel_size) * pixel_size
-    miny = math.floor(miny / pixel_size) * pixel_size
-    maxx = math.ceil(maxx / pixel_size) * pixel_size
-    maxy = math.ceil(maxy / pixel_size) * pixel_size
+    minx = _floor_to_grid(minx, pixel_size)
+    miny = _floor_to_grid(miny, pixel_size)
+    maxx = _ceil_to_grid(maxx, pixel_size)
+    maxy = _ceil_to_grid(maxy, pixel_size)
 
     width = int(math.ceil((maxx - minx) / pixel_size))
     height = int(math.ceil((maxy - miny) / pixel_size))
@@ -2403,12 +2445,10 @@ def stitch_coverage_masks(
                     source_count = np.float64(0)
                     with rasterio.open(source_path) as source:
                         source_bounds = _raster_bounds_in_crs(source, target_crs)
-                        target_window = _integer_window(
-                            from_bounds(*source_bounds, transform=target_transform),
-                            target.width,
-                            target.height,
+                        source_bounds_list = _split_wgs84_antimeridian_bounds(
+                            source_bounds
                         )
-                        if target_window.width == 0 or target_window.height == 0:
+                        if not source_bounds_list:
                             coverage_counts_by_id[coverage_id] = source_count
                             continue
 
@@ -2424,18 +2464,33 @@ def stitch_coverage_masks(
                             vrt_kwargs["src_nodata"] = source.nodata
 
                         with WarpedVRT(source, **vrt_kwargs) as source_vrt:
-                            for window in _iter_block_windows(target_window):
-                                incoming = source_vrt.read(1, window=window)
-                                incoming = (incoming > 0).astype(np.uint8)
-                                stitch_state["pixels"] += int(
-                                    window.width * window.height
+                            for bounds_part in source_bounds_list:
+                                target_window = _integer_window(
+                                    from_bounds(
+                                        *bounds_part,
+                                        transform=target_transform,
+                                    ),
+                                    target.width,
+                                    target.height,
                                 )
-                                source_count += np.sum(incoming, dtype=np.float64)
-                                if not np.any(incoming):
+                                if (
+                                    target_window.width == 0
+                                    or target_window.height == 0
+                                ):
                                     continue
-                                existing = target.read(1, window=window)
-                                np.maximum(existing, incoming, out=existing)
-                                target.write(existing, 1, window=window)
+
+                                for window in _iter_block_windows(target_window):
+                                    incoming = source_vrt.read(1, window=window)
+                                    incoming = (incoming > 0).astype(np.uint8)
+                                    stitch_state["pixels"] += int(
+                                        window.width * window.height
+                                    )
+                                    source_count += np.sum(incoming, dtype=np.float64)
+                                    if not np.any(incoming):
+                                        continue
+                                    existing = target.read(1, window=window)
+                                    np.maximum(existing, incoming, out=existing)
+                                    target.write(existing, 1, window=window)
 
                     coverage_counts_by_id[coverage_id] = source_count
                     stitch_state["index"] = raster_index

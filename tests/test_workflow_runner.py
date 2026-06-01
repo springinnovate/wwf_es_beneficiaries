@@ -8,6 +8,7 @@ import numpy as np
 import rasterio
 from pyproj import CRS, Transformer
 from rasterio.transform import from_origin
+from rasterio.windows import from_bounds
 from shapely.geometry import Point, box
 from shapely.ops import transform
 
@@ -206,6 +207,37 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
         np.testing.assert_array_equal(
             result,
             np.array([[1, 1], [0, 0]], dtype=np.uint8),
+        )
+
+    def test_antimeridian_bounds_split_into_valid_wgs84_windows(self):
+        bounds = (167.7408, 66.7660, -179.1999, 70.0103)
+
+        split_bounds = workflow_runner._split_wgs84_antimeridian_bounds(bounds)
+
+        self.assertEqual(
+            split_bounds,
+            [
+                (167.7408, 66.7660, 180.0, 70.0103),
+                (-180.0, 66.7660, -179.1999, 70.0103),
+            ],
+        )
+        transform = from_origin(-180, 90, 1, 1)
+        for bounds_part in split_bounds:
+            window = workflow_runner._integer_window(
+                from_bounds(*bounds_part, transform=transform),
+                360,
+                180,
+            )
+            self.assertGreater(window.width, 0)
+            self.assertGreater(window.height, 0)
+        pixel_size = 0.008333333333333
+        self.assertAlmostEqual(
+            workflow_runner._floor_to_grid(-180.0, pixel_size),
+            -180.0,
+        )
+        self.assertAlmostEqual(
+            workflow_runner._ceil_to_grid(180.0, pixel_size),
+            180.0,
         )
 
     def test_windowed_travel_reach_matches_whole_raster_reach(self):
