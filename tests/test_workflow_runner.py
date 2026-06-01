@@ -4,6 +4,7 @@ from unittest import mock
 from pathlib import Path
 import tempfile
 
+import geopandas as gpd
 import numpy as np
 import rasterio
 from pyproj import CRS, Transformer
@@ -161,6 +162,44 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
             1,
         )
         self.assertEqual(mask[0, 0], 1)
+
+    def test_mask_raster_to_vector_sets_default_nodata_outside_geometry(self):
+        raster_profile = {
+            "driver": "GTiff",
+            "height": 4,
+            "width": 4,
+            "count": 1,
+            "dtype": "int16",
+            "crs": "EPSG:4326",
+            "transform": from_origin(0, 4, 1, 1),
+        }
+        workflow_runner._set_tiled_geotiff_creation_options(raster_profile)
+
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            raster_path = workspace_path / "dem.tif"
+            vector_path = workspace_path / "mask.gpkg"
+            raster_array = np.arange(16, dtype=np.int16).reshape((4, 4))
+            raster_array[1, 1] = 0
+            with rasterio.open(raster_path, "w", **raster_profile) as raster:
+                raster.write(raster_array, 1)
+            gpd.GeoDataFrame(
+                geometry=[box(0, 0, 2, 4)],
+                crs="EPSG:4326",
+            ).to_file(vector_path, driver="GPKG")
+
+            workflow_runner.mask_raster_to_vector(raster_path, vector_path)
+
+            with rasterio.open(raster_path) as masked_raster:
+                masked_array = masked_raster.read(1)
+                nodata = masked_raster.nodata
+
+        self.assertEqual(nodata, np.iinfo(np.int16).min)
+        self.assertEqual(masked_array[1, 1], 0)
+        np.testing.assert_array_equal(
+            masked_array[:, 2:],
+            np.full((4, 2), np.iinfo(np.int16).min, dtype=np.int16),
+        )
 
     def test_stitch_coverage_masks_uses_union_semantics(self):
         profile = {

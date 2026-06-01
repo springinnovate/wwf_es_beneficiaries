@@ -1370,7 +1370,10 @@ def mask_raster_to_vector(raster_path: str | Path, vector_path: str | Path) -> N
         if not geometries:
             raise ValueError(f"No valid geometries found in {vector_path}.")
 
-        outside_value = raster.nodata if raster.nodata is not None else 0
+        outside_value = raster.nodata
+        if outside_value is None:
+            outside_value = _default_nodata_for_dtype(raster.dtypes[0])
+            raster.nodata = outside_value
         for _, window in raster.block_windows(1):
             block = raster.read(1, window=window)
             inside_mask = rasterio.features.geometry_mask(
@@ -1381,6 +1384,19 @@ def mask_raster_to_vector(raster_path: str | Path, vector_path: str | Path) -> N
             )
             block[~inside_mask] = outside_value
             raster.write(block, 1, window=window)
+
+
+def _default_nodata_for_dtype(dtype) -> int | float:
+    """Return a dtype-safe nodata value for rasters that do not define one."""
+    dtype = np.dtype(dtype)
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        if np.issubdtype(dtype, np.signedinteger):
+            return int(info.min)
+        return int(info.max)
+    if np.issubdtype(dtype, np.floating):
+        return float(-np.finfo(dtype).max)
+    raise ValueError(f"No default nodata value is defined for dtype {dtype}")
 
 
 def eck4_limits(r=6371000):
