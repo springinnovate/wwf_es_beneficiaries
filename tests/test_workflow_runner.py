@@ -281,6 +281,25 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
                 queue_guard_multiplier=0,
             )
 
+    def test_travel_reach_ignores_nan_friction(self):
+        friction = np.ones((3, 3), dtype=np.float32)
+        friction[1, 2] = np.nan
+        source_mask = np.zeros((3, 3), dtype=np.int8)
+        source_mask[1, 1] = 1
+
+        result = workflow_runner.shortest_distances.find_mask_reach(
+            friction,
+            source_mask,
+            1.0,
+            3,
+            3,
+            2.0,
+            progress_interval_seconds=0,
+        )
+
+        self.assertEqual(result[1, 2], 0)
+        self.assertEqual(result[1, 1], 1)
+
     def test_mask_population_with_coverage_applies_coverage_once(self):
         transform = from_origin(0, 2, 1, 1)
         coverage_profile = {

@@ -23,6 +23,7 @@ import numpy
 
 cimport cython
 cimport numpy
+from libc.math cimport isfinite
 from libc.math cimport sqrt
 from libc.time cimport time as ctime
 from libc.time cimport time_t
@@ -153,7 +154,8 @@ def find_mask_reach(
                         continue
                     if mask_array[j_n, i_n] != 0:
                         continue
-                    if friction_array[j_n, i_n] <= 0:
+                    frict_n = friction_array[j_n, i_n]
+                    if not isfinite(frict_n) or frict_n <= 0:
                         continue
                     is_frontier = True
                     break
@@ -234,7 +236,7 @@ def find_mask_reach(
                         continue
                     frict_n = friction_array[j_n, i_n]
                     # the nodata value is undefined but will present as 0.
-                    if frict_n <= 0:
+                    if not isfinite(frict_n) or frict_n <= 0:
                         continue
                     if v & 1:  # if msd is 1, it's odd
                         edge_weight = frict_n*diag_cell_length_m
