@@ -615,12 +615,31 @@ def process_config(config_path: Path) -> Dict[str, Any]:
 
     if errors:
         raise ValueError("Invalid sections:\n  - " + "\n  - ".join(errors))
+
+    for mask_index, mask_section in enumerate(masks):
+        if mask_section.get("type") != "travel_time_population":
+            continue
+        params = mask_section.get("params", {}) or {}
+        missing_travel_params = [
+            key
+            for key in ("condition_raster_path", "expression", "max_hours")
+            if not params.get(key)
+        ]
+        if missing_travel_params:
+            raise ValueError(
+                "travel_time_population mask "
+                f"{mask_section.get('id') or mask_index!r} is missing required "
+                "param(s): "
+                + ", ".join(missing_travel_params)
+            )
+
     if debug_drain_index is not None and not any(
-        mask_section.get("type") == "conditional_raster" for mask_section in masks
+        mask_section.get("type") in {"conditional_raster", "travel_time_population"}
+        for mask_section in masks
     ):
         raise ValueError(
             "`inputs.debug_drain_index` can only be used when at least one "
-            "conditional_raster mask is configured."
+            "drain-partitioned mask is configured."
         )
     logging_cfg = raw_yaml.get("logging", {}) or {}
     log_level = logging_cfg.get("level", "INFO")
@@ -820,7 +839,10 @@ def _raster_paths_for_full_extent(config: dict) -> list[Path]:
         inputs["dem_raster_path"],
     ]
     for mask_section in config["masks"]:
-        if mask_section["type"] != "conditional_raster":
+        if mask_section["type"] not in {
+            "conditional_raster",
+            "travel_time_population",
+        }:
             continue
         condition_raster_path = mask_section.get("params", {}).get(
             "condition_raster_path"
@@ -1719,26 +1741,28 @@ def calculate_windowed_travel_reach(
 def calculate_travel_time_coverage(
     traveltime_raster_path: Path,
     aoi_vector_path: Path,
+    condition_raster_path: Path,
+    expression: str,
     max_hours: float,
     travel_time_pixel_size_m: float,
     target_coverage_raster_path: Path,
     working_dir: Path,
-    use_wgs84_bounds_mask: bool = False,
 ):
-    """Create a binary travel-time coverage raster clipped to an AOI.
+    """Create travel-time coverage from condition cells within an AOI.
 
     Args:
         traveltime_raster_path (str | Path): Path to a raster where each pixel
             encodes travel time (hours) to a target destination.
         aoi_vector_path (str | Path): Path to a vector dataset (e.g. Shapefile,
-            GeoPackage) defining the area of interest to clip to.
+            GeoPackage) defining the drain partition to clip to.
+        condition_raster_path (str | Path): Raster containing candidate source
+            cells for the travel-time expansion.
+        expression (str): NumPy-compatible expression evaluated against
+            ``condition_raster_path`` values. True pixels become travel-time
+            source cells.
         max_hours (float): Maximum travel time in hours to include.
         travel_time_pixel_size_m (float): Target travel-time raster pixel size
             in meters.
-        use_wgs84_bounds_mask (bool): If true, rasterize the AOI as a WGS84
-            bounds mask from pixel centers. This is intended for generated
-            full-extent AOIs, where projecting a near-global rectangle into a
-            local projected CRS can collapse the rasterized mask.
 
     Returns:
         Path: ``target_coverage_raster_path``.
@@ -1755,7 +1779,6 @@ def calculate_travel_time_coverage(
 
     analysis_crs = choose_equidistant_crs_from_bbox(str(aoi_vector_path)).crs
     aoi_vector = gpd.read_file(aoi_vector_path)
-    aoi_wgs84_bounds = aoi_vector.to_crs("EPSG:4326").total_bounds
     projected_gdf = aoi_vector.to_crs(analysis_crs)
     bbox = projected_gdf.total_bounds
     # This max-distance bound is precomputed for the global friction raster
@@ -1770,12 +1793,10 @@ def calculate_travel_time_coverage(
     )
 
     logger.debug(f"buffered box: {buffered_bbox}")
-    bbox_gdf = gpd.GeoDataFrame({"geometry": [buffered_bbox]}, crs=projected_gdf.crs)
-
     target_friction_clipped_raster_path = Path(
         working_dir / f"{traveltime_raster_path.stem}_friction_clip.tif"
     )
-    target_aoi_raster_path = Path(working_dir / "travel_time_aoi_mask.tif")
+    target_source_mask_raster_path = Path(working_dir / "travel_time_source_mask.tif")
 
     logger.info(
         "preparing travel-time coverage for %s in %s",
@@ -1802,7 +1823,6 @@ def calculate_travel_time_coverage(
         )
 
     with rasterio.open(target_friction_clipped_raster_path) as friction_ref:
-        ref_meta = friction_ref.profile.copy()
         cell_length_m = abs(friction_ref.transform.a)
         buffer_pixels = int(math.ceil(buffer_distance_m / cell_length_m))
         logger.info(
@@ -1815,23 +1835,18 @@ def calculate_travel_time_coverage(
             buffer_pixels,
         )
 
-    aoi_meta = ref_meta.copy()
-    aoi_meta.update(
-        {"count": 1, "dtype": rasterio.uint8, "nodata": 0, "compress": "lzw"}
-    )
-    _set_tiled_geotiff_creation_options(aoi_meta)
-
-    _write_mask_raster_by_window(
-        target_aoi_raster_path,
-        aoi_meta,
-        projected_gdf.geometry,
-        use_wgs84_bounds_mask=use_wgs84_bounds_mask,
-        wgs84_bounds=aoi_wgs84_bounds,
+    create_travel_time_source_mask(
+        condition_raster_path,
+        expression,
+        aoi_vector_path,
+        target_friction_clipped_raster_path,
+        working_dir,
+        target_source_mask_raster_path,
     )
 
     result_path = calculate_windowed_travel_reach(
         target_friction_clipped_raster_path,
-        target_aoi_raster_path,
+        target_source_mask_raster_path,
         target_coverage_raster_path,
         max_time_mins,
         buffer_pixels,
@@ -1929,6 +1944,54 @@ def make_condition_mask_op(base_raster_nodata, expression):
         return result
 
     return _condition_mask_op
+
+
+def create_travel_time_source_mask(
+    condition_raster_path,
+    expression,
+    aoi_vector_path,
+    reference_raster_path,
+    working_dir,
+    target_source_mask_raster_path,
+):
+    """Create a binary travel-time source mask on the travel grid.
+
+    The drain geometry limits where hotspot cells can become sources, while
+    the condition raster and expression decide which cells actually start the
+    outward travel-time expansion.
+    """
+    condition_raster_path = Path(condition_raster_path)
+    working_dir = Path(working_dir)
+    target_source_mask_raster_path = Path(target_source_mask_raster_path)
+    clipped_condition_raster_path = (
+        working_dir / f"travel_time_condition_{condition_raster_path.name}"
+    )
+
+    reference_info = geoprocessing.get_raster_info(str(reference_raster_path))
+    condition_info = geoprocessing.get_raster_info(str(condition_raster_path))
+    geoprocessing.warp_raster(
+        str(condition_raster_path),
+        reference_info["pixel_size"],
+        str(clipped_condition_raster_path),
+        "near",
+        target_bb=reference_info["bounding_box"],
+        target_projection_wkt=reference_info["projection_wkt"],
+        working_dir=str(working_dir),
+        output_type=condition_info["datatype"],
+        vector_mask_options={"mask_vector_path": str(aoi_vector_path)},
+        raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
+    )
+
+    geoprocessing.raster_calculator(
+        [(str(clipped_condition_raster_path), 1)],
+        make_condition_mask_op(condition_info["nodata"][0], expression),
+        str(target_source_mask_raster_path),
+        gdal.GDT_Byte,
+        0,
+        calc_raster_stats=False,
+        raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
+    )
+    return target_source_mask_raster_path
 
 
 def calculate_downstream_coverage_from_conditional_raster(
@@ -2672,9 +2735,13 @@ def main() -> None:
     logger.info(f"found {len(aoi_id_to_path)} aois to process")
 
     wgs84_pixel_size = config["inputs"]["wgs84_pixel_size"]
+    has_travel_time_mask = any(
+        mask.get("type") == "travel_time_population" for mask in config.get("masks", [])
+    )
     has_conditional_mask = any(
         mask.get("type") == "conditional_raster" for mask in config.get("masks", [])
     )
+    needs_drain_partitions = has_conditional_mask or has_travel_time_mask
     debug_drain_index = config["inputs"].get("debug_drain_index")
 
     aoi_work_items = {}
@@ -2682,7 +2749,7 @@ def main() -> None:
         working_dir = Path(config["work_dir"]) / Path(aoi_key)
         working_dir.mkdir(parents=True, exist_ok=True)
         picked_crs = choose_equidistant_crs_from_bbox(aoi_vector_path)
-        if has_conditional_mask:
+        if needs_drain_partitions:
             partition_paths = partition_subwatersheds_by_terminal_drain(
                 aoi_vector_path,
                 config["inputs"]["subwatershed_vector_path"],
@@ -2711,7 +2778,7 @@ def main() -> None:
             "working_dir": working_dir,
             "partition_paths": partition_paths,
         }
-        if has_conditional_mask:
+        if needs_drain_partitions:
             logger.info(
                 "found %d drain partitions for %s",
                 len(partition_paths),
@@ -2721,7 +2788,7 @@ def main() -> None:
     work_unit_count = sum(
         len(item["partition_paths"]) for item in aoi_work_items.values()
     )
-    if not has_conditional_mask:
+    if not needs_drain_partitions:
         work_unit_count = len(aoi_work_items)
     n_workers = calculate_taskgraph_worker_count(config, work_unit_count)
     update_rate = None  # Supress taskgraph output
@@ -2739,49 +2806,59 @@ def main() -> None:
         dem_raster_path = config["inputs"]["dem_raster_path"]
 
         partition_contexts = {}
-        if has_conditional_mask:
+        if needs_drain_partitions:
             for partition_id, partition_vector_path in aoi_info[
                 "partition_paths"
             ].items():
                 partition_working_dir = working_dir / partition_id
                 partition_working_dir.mkdir(parents=True, exist_ok=True)
-                clipped_dem_path = str(
-                    partition_working_dir / f"{Path(dem_raster_path).stem}_clipped.tif"
-                )
-                dem_clip_task = task_graph.add_task(
-                    func=align_and_resize_raster_on_vector,
-                    args=(
-                        dem_raster_path,
-                        clipped_dem_path,
-                        "near",
-                        [wgs84_pixel_size, -wgs84_pixel_size],
-                        partition_vector_path,
-                    ),
-                    target_path_list=[clipped_dem_path],
-                    task_name=f"clip DEM for {aoi_key} {partition_id}",
-                )
-                dem_path_root, dem_path_ext = os.path.splitext(str(clipped_dem_path))
-                target_flow_dir_raster_path = f"{dem_path_root}_mfdflow{dem_path_ext}"
-                flow_dir_task = task_graph.add_task(
-                    func=calc_flow_dir,
-                    args=(
-                        clipped_dem_path,
-                        partition_working_dir,
-                        target_flow_dir_raster_path,
-                    ),
-                    dependent_task_list=[dem_clip_task],
-                    target_path_list=[target_flow_dir_raster_path],
-                    task_name=f"calculate flow dir for {aoi_key} {partition_id}",
-                )
+                flow_dir_task = None
+                target_flow_dir_raster_path = None
+                if has_conditional_mask:
+                    clipped_dem_path = str(
+                        partition_working_dir
+                        / f"{Path(dem_raster_path).stem}_clipped.tif"
+                    )
+                    dem_clip_task = task_graph.add_task(
+                        func=align_and_resize_raster_on_vector,
+                        args=(
+                            dem_raster_path,
+                            clipped_dem_path,
+                            "near",
+                            [wgs84_pixel_size, -wgs84_pixel_size],
+                            partition_vector_path,
+                        ),
+                        target_path_list=[clipped_dem_path],
+                        task_name=f"clip DEM for {aoi_key} {partition_id}",
+                    )
+                    dem_path_root, dem_path_ext = os.path.splitext(str(clipped_dem_path))
+                    target_flow_dir_raster_path = (
+                        f"{dem_path_root}_mfdflow{dem_path_ext}"
+                    )
+                    flow_dir_task = task_graph.add_task(
+                        func=calc_flow_dir,
+                        args=(
+                            clipped_dem_path,
+                            partition_working_dir,
+                            target_flow_dir_raster_path,
+                        ),
+                        dependent_task_list=[dem_clip_task],
+                        target_path_list=[target_flow_dir_raster_path],
+                        task_name=f"calculate flow dir for {aoi_key} {partition_id}",
+                    )
                 partition_contexts[partition_id] = {
                     "vector_path": partition_vector_path,
-                    "flow_dir_raster_path": Path(target_flow_dir_raster_path),
+                    "flow_dir_raster_path": (
+                        None
+                        if target_flow_dir_raster_path is None
+                        else Path(target_flow_dir_raster_path)
+                    ),
                     "flow_dir_task": flow_dir_task,
                     "working_dir": partition_working_dir,
                 }
             if not partition_contexts:
                 raise ValueError(
-                    f"No drain partitions were found for conditional AOI {aoi_key}."
+                    f"No drain partitions were found for AOI {aoi_key}."
                 )
         else:
             partition_contexts[aoi_key] = {
@@ -2813,21 +2890,17 @@ def main() -> None:
                     travel_time_working_dir = (
                         partition_context["working_dir"] / f"{section_id}_workdir"
                     )
-                    use_wgs84_bounds_mask = (
-                        aoi_key == FULL_RASTER_EXTENT_AOI_ID
-                        and not has_conditional_mask
-                        and debug_drain_index is None
-                    )
                     travel_task = task_graph.add_task(
                         func=calculate_travel_time_coverage,
                         args=(
                             config["inputs"]["traveltime_raster_path"],
                             partition_context["vector_path"],
+                            Path(mask_section["params"]["condition_raster_path"]),
+                            mask_section["params"]["expression"],
                             mask_section["params"]["max_hours"],
                             config["inputs"]["travel_time_pixel_size_m"],
                             partition_coverage_raster_path,
                             travel_time_working_dir,
-                            use_wgs84_bounds_mask,
                         ),
                         target_path_list=[partition_coverage_raster_path],
                         task_name=(
