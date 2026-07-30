@@ -1,0 +1,42 @@
+# July 2026 retained-service hotspot count, 1+ services.
+# python workflow_runner.py configs/jeronimo_2026_07_hotspot_count_1plus_beneficiaries.yaml
+run_name: jeronimo_2026_07_hotspot_count_1plus_beneficiaries
+work_dir: ./output_jeronimo_2026_07_29_18_49_00_hotspot_count_1plus_beneficiaries/workdir
+output_dir: ./output_jeronimo_2026_07_29_18_49_00_hotspot_count_1plus_beneficiaries
+
+inputs:
+  # leave pixel sizes alone unless you know what you're doing
+  wgs84_pixel_size: 0.008333333333333
+  travel_time_pixel_size_m: 900
+  buffer_size_m: 5000
+  population_raster_path: "./data/pop_rasters/landscan-global-2023.tif"
+  traveltime_raster_path: "./data/travel_time/friction_surface_2019_compressed_md5_1be7dd230178a5d395529be7a5e3fb0a.tif"
+  dem_raster_path: "./data/dem_precondition/astgtm_compressed.tif"
+  subwatershed_vector_path: "./data/dem_precondition/merged_lev06.shp"
+  analyze_full_raster_extent: true
+  taskgraph_workers: 12
+  gdal_cachemax_mb: 128
+  #debug_drain_index: 170
+  aoi_vector_pattern:
+  #  - "./wwf_aois/*.gpkg"
+
+sections:
+  - masks:
+    - id: within_travel_time
+      type: travel_time_population
+      params:
+        condition_raster_path: "D:/Users/richp/Downloads/hotspots_rasters-20260729T024121Z-1-001/hotspots_rasters/hotspot_count_pct_2026_07_29_18_49_00.tif"
+        expression: 'value > 0'
+        max_hours: 1.0
+    - id: downstream_50k
+      type: conditional_raster
+      params:
+        condition_raster_path: "D:/Users/richp/Downloads/hotspots_rasters-20260729T024121Z-1-001/hotspots_rasters/hotspot_count_pct_2026_07_29_18_49_00.tif"
+        expression: 'value > 0'
+        max_downstream_distance_m: 50000
+  - combine:
+    - logic: OR
+
+logging:
+  level: INFO
+  to_file: output.log
