@@ -18,6 +18,103 @@ import workflow_runner
 
 class Wgs84BoundsMaskTests(unittest.TestCase):
 
+    def test_flow_direction_forwards_pit_filling_options(self) -> None:
+        """Forward explicit or default filling options without changing MFD options."""
+        for options, limit, closed in [
+            ({}, -1, False),
+            ({"max_pixel_fill_count": 100, "treat_nodata_as_closed": True}, 100, True),
+        ]:
+            with (
+                self.subTest(options=options),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                working_dir = Path(directory)
+                with (
+                    mock.patch.object(workflow_runner.routing, "fill_pits") as fill_pits,
+                    mock.patch.object(workflow_runner.routing, "flow_dir_mfd") as flow_dir,
+                ):
+                    workflow_runner.calc_flow_dir(
+                        "dem.tif", working_dir, "flow.tif", **options
+                    )
+                filled = working_dir / "pit_filled_dem.tif"
+                fill_pits.assert_called_once_with(
+                    ("dem.tif", 1),
+                    filled,
+                    working_dir=working_dir,
+                    max_pixel_fill_count=limit,
+                    treat_nodata_as_closed=closed,
+                    raster_driver_creation_tuple=workflow_runner.GTIFF_CREATION_TUPLE,
+                )
+                flow_dir.assert_called_once_with(
+                    (str(filled), 1),
+                    "flow.tif",
+                    working_dir=str(working_dir),
+                    raster_driver_creation_tuple=workflow_runner.GTIFF_CREATION_TUPLE,
+                )
+
+    def test_pit_filling_yaml_options(self) -> None:
+        """Accept defaults and explicit filling settings; reject malformed YAML values."""
+        with tempfile.TemporaryDirectory() as directory:
+            working_dir = Path(directory)
+            source = working_dir / "source.tif"
+            source.touch()
+            config_path = working_dir / "pit_filling.yaml"
+            inputs = {
+                "population_raster_path": str(source),
+                "traveltime_raster_path": str(source),
+                "dem_raster_path": str(source),
+                "subwatershed_vector_path": str(source),
+                "analyze_full_raster_extent": True,
+                "wgs84_pixel_size": 1,
+                "travel_time_pixel_size_m": 1000,
+                "buffer_size_m": 0,
+            }
+            config = {
+                "run_name": "pit_filling",
+                "work_dir": str(working_dir / "work"),
+                "output_dir": str(working_dir / "output"),
+                "sections": [
+                    {
+                        "masks": [{
+                            "id": "starting",
+                            "type": "conditional_raster",
+                            "params": {
+                                "condition_raster_path": str(source),
+                                "expression": "value > 0",
+                            },
+                        }]
+                    },
+                    {"combine": [{"logic": "OR"}]},
+                ],
+            }
+            for options, limit, closed in [
+                ({}, -1, False),
+                ({"max_pixel_fill_count": 100, "treat_nodata_as_closed": True}, 100, True),
+                ({"max_pixel_fill_count": 0}, 0, False),
+            ]:
+                with self.subTest(options=options):
+                    config["inputs"] = {**inputs, **options}
+                    config_path.write_text(
+                        workflow_runner.yaml.safe_dump(config), encoding="utf-8"
+                    )
+                    parsed = workflow_runner.process_config(config_path)["inputs"]
+                    self.assertEqual(parsed["max_pixel_fill_count"], limit)
+                    self.assertIs(parsed["treat_nodata_as_closed"], closed)
+            for name, invalid in [
+                ("max_pixel_fill_count", True),
+                ("max_pixel_fill_count", 1.5),
+                ("max_pixel_fill_count", -2),
+                ("treat_nodata_as_closed", "true"),
+                ("treat_nodata_as_closed", 1),
+            ]:
+                with self.subTest(name=name, invalid=invalid):
+                    config["inputs"] = {**inputs, name: invalid}
+                    config_path.write_text(
+                        workflow_runner.yaml.safe_dump(config), encoding="utf-8"
+                    )
+                    with self.assertRaisesRegex(ValueError, name):
+                        workflow_runner.process_config(config_path)
+
     def test_conditional_workflows_default_to_two_workers(self):
         config = {
             "inputs": {"taskgraph_workers": None},
