@@ -404,6 +404,8 @@ def process_config(config_path: Path) -> Dict[str, Any]:
                 - 'debug_drain_index' (int | None)
                 - 'taskgraph_workers' (int | None)
                 - 'gdal_cachemax_mb' (int)
+                - 'max_pixel_fill_count' (int)
+                - 'treat_nodata_as_closed' (bool)
             - 'masks' (list[dict]): Each item has 'id' (str), 'type' (str),
               and 'params' (dict).
             - 'combine' (list[dict]): As provided in the YAML 'combine'
@@ -500,6 +502,23 @@ def process_config(config_path: Path) -> Dict[str, Any]:
         raise ValueError(
             "`inputs.gdal_cachemax_mb` must be a positive integer, "
             f"got {gdal_cachemax_mb}"
+        )
+
+    max_pixel_fill_count = inputs.get("max_pixel_fill_count", -1)
+    if (
+        isinstance(max_pixel_fill_count, bool)
+        or not isinstance(max_pixel_fill_count, int)
+        or max_pixel_fill_count < -1
+    ):
+        raise ValueError(
+            "`inputs.max_pixel_fill_count` must be an integer >= -1, "
+            f"got {max_pixel_fill_count!r}"
+        )
+    treat_nodata_as_closed = inputs.get("treat_nodata_as_closed", False)
+    if not isinstance(treat_nodata_as_closed, bool):
+        raise ValueError(
+            "`inputs.treat_nodata_as_closed` must be true or false, "
+            f"got {treat_nodata_as_closed!r}"
         )
 
     wgs84_pixel_size = inputs.get("wgs84_pixel_size", None)
@@ -645,6 +664,8 @@ def process_config(config_path: Path) -> Dict[str, Any]:
             "debug_drain_index": debug_drain_index,
             "taskgraph_workers": taskgraph_workers,
             "gdal_cachemax_mb": gdal_cachemax_mb,
+            "max_pixel_fill_count": max_pixel_fill_count,
+            "treat_nodata_as_closed": treat_nodata_as_closed,
             "wgs84_pixel_size": float(wgs84_pixel_size),
             "travel_time_pixel_size_m": float(travel_time_pixel_size_m),
             "buffer_size_m": float(buffer_size_m),
@@ -2181,7 +2202,30 @@ def calculate_downstream_coverage_from_conditional_raster(
     return target_coverage_raster_path
 
 
-def calc_flow_dir(dem_path, working_dir, target_flow_dir_raster_path):
+def calc_flow_dir(
+    dem_path: str | Path,
+    working_dir: Path,
+    target_flow_dir_raster_path: str | Path,
+    *,
+    max_pixel_fill_count: int = -1,
+    treat_nodata_as_closed: bool = False,
+) -> None:
+    """Fill DEM depressions and calculate multiple-flow-direction routing.
+
+    Args:
+        dem_path: Clipped DEM raster to prepare for routing.
+        working_dir: Directory receiving the pit-filled DEM and routing scratch.
+        target_flow_dir_raster_path: Destination for the MFD flow-direction raster.
+        max_pixel_fill_count: EcoShard's pit-search budget, not an exact count of
+            changed cells. Positive values stop an unsuccessful search; -1 and 0
+            leave it unlimited.
+        treat_nodata_as_closed: Ignore NoData and raster edges as drains during
+            pit filling. This does not change the subsequent MFD algorithm.
+
+    Raises:
+        RuntimeError: If GDAL cannot read or write a required raster.
+        ValueError: If EcoShard rejects a raster argument.
+    """
     configure_gdal_cache()
     logger = logging.getLogger(__name__)
     worker_label = f"flow direction worker {Path(target_flow_dir_raster_path).stem}"
@@ -2193,6 +2237,8 @@ def calc_flow_dir(dem_path, working_dir, target_flow_dir_raster_path):
         (dem_path, 1),
         pit_filled_raster_path,
         working_dir=working_dir,
+        max_pixel_fill_count=max_pixel_fill_count,
+        treat_nodata_as_closed=treat_nodata_as_closed,
         raster_driver_creation_tuple=GTIFF_CREATION_TUPLE,
     )
     routing.flow_dir_mfd(
@@ -2849,6 +2895,14 @@ def main() -> None:
                             partition_working_dir,
                             target_flow_dir_raster_path,
                         ),
+                        kwargs={
+                            "max_pixel_fill_count": config["inputs"][
+                                "max_pixel_fill_count"
+                            ],
+                            "treat_nodata_as_closed": config["inputs"][
+                                "treat_nodata_as_closed"
+                            ],
+                        },
                         dependent_task_list=[dem_clip_task],
                         target_path_list=[target_flow_dir_raster_path],
                         task_name=f"calculate flow dir for {aoi_key} {partition_id}",

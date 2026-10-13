@@ -339,3 +339,25 @@ counting where two masks identify the same people.
 
 The output CSV reports the summed population for each individual mask and the
 summed population in the combined raster.
+
+## Pit filling before downstream routing
+
+Optional YAML inputs control the existing EcoShard pit filler:
+
+```yaml
+inputs:
+  treat_nodata_as_closed: true
+  max_pixel_fill_count: 100
+```
+
+With these settings, pit filling ignores NoData holes and the raster boundary as
+outlets and stops searching for a pit's pour point after the existing 100-pixel
+search budget. The budget is not an exact count of cells changed. Unresolved
+pits remain, and MFD routing runs afterward with its existing behavior, including
+its NoData fallback. This does not guarantee that every path reaches the coast.
+
+Omitting these options preserves open edges and unlimited pit filling. A
+`max_pixel_fill_count` of `-1` or `0` is unlimited. These options require EcoShard
+with `treat_nodata_as_closed` support (commit
+`8d6b778edbaaff6e5dc3cc04d9da7f9416522054` or later). Existing Docker builds fetch
+EcoShard from its main branch.
