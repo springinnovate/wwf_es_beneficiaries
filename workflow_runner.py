@@ -12,8 +12,10 @@ python workflow_runner.py ./example_roadmap2030_pop_downstream_analysis.yaml
 """
 
 from __future__ import annotations
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 import collections
 import contextlib
 import math
@@ -27,6 +29,7 @@ import sys
 import threading
 import time
 from itertools import islice
+from xml.etree import ElementTree
 
 from ecoshard import taskgraph
 import psutil
@@ -40,6 +43,9 @@ from rasterio.warp import (
 )
 from rasterio.transform import from_origin
 from rasterio.vrt import WarpedVRT
+from rasterio.enums import MaskFlags
+from rasterio.io import MemoryFile
+from rasterio.shutil import copy as copy_raster
 from rasterio.windows import Window, from_bounds
 from ecoshard import geoprocessing
 from ecoshard.geoprocessing import routing
@@ -2633,6 +2639,146 @@ def stitch_coverage_masks(
     return coverage_counts_by_id
 
 
+def _build_population_index_vrt(
+    population: rasterio.io.DatasetReader,
+) -> tuple[str, int | None]:
+    """Describe a virtual raster of source columns and rows and read the exact NoData tag.
+
+    Args:
+        population: Open UInt64 population raster.
+
+    Returns:
+        GDAL VRT XML with two Int32 bands on the population grid, and its
+        original UInt64 NoData value if declared. GDAL generates the column
+        and row sequences on demand. Only the grid metadata is copied.
+
+    Raises:
+        rasterio.errors.RasterioError: If GDAL cannot copy the source metadata.
+    """
+    # Rasterio exposes numeric NoData through a double. A GDAL VRT copy
+    # serializes the full UInt64 tag, including values adjacent to the maximum.
+    with MemoryFile(ext=".vrt") as metadata:
+        copy_raster(population, metadata.name, driver="VRT")
+        original = ElementTree.fromstring(metadata.read())
+    nodata = original.findtext("VRTRasterBand/NoDataValue")
+    height, width = population.shape
+    grid = ElementTree.Element(
+        "VRTDataset", rasterXSize=str(width), rasterYSize=str(height)
+    )
+    for element in original:
+        if element.tag in {"SRS", "GeoTransform", "GCPList", "Metadata"}:
+            grid.append(element)
+    # Expand a one-row column sequence and a one-column row sequence across
+    # the grid. Neither band needs a raster file or a grid-sized index array.
+    for band, size, view in ((1, width, "[newaxis,:]"), (2, height, "[:,newaxis]")):
+        grid.append(ElementTree.fromstring(f"""
+            <VRTRasterBand dataType="Int32" band="{band}">
+              <ArraySource>
+                <DerivedArray>
+                  <Array name="index"><DataType>Int32</DataType>
+                    <Dimension name="pixel" size="{size}"/>
+                    <RegularlySpacedValues start="0" increment="1"/>
+                  </Array>
+                  <Step><View expr="{view}"/></Step>
+                </DerivedArray>
+                <DstRect xOff="0" yOff="0" xSize="{width}" ySize="{height}"/>
+              </ArraySource>
+            </VRTRasterBand>"""))
+    return ElementTree.tostring(grid, encoding="unicode"), (
+        int(nodata) if nodata is not None else None
+    )
+
+
+def _read_uint64_population_window(
+    population: rasterio.io.DatasetReader,
+    warped_indices: WarpedVRT,
+    window: Window,
+) -> np.ndarray:
+    """Sample native UInt64 pixels nearest the coverage cell centers.
+
+    The ordinary GDAL warp selects source pixel indices. Reading those pixels
+    directly avoids converting their values to double. Grouping by source tile
+    bounds each read even when neighboring output cells map far apart.
+
+    Args:
+        population: Original UInt64 population raster with its validity metadata.
+        warped_indices: Source column and row bands warped to the coverage grid.
+        window: Integer pixel window on the coverage grid.
+
+    Returns:
+        A UInt64 array with zero outside the source or its validity mask.
+        Numeric NoData is excluded by the caller using the exact integer tag.
+
+    Raises:
+        rasterio.errors.RasterioError: If a source or index window cannot be read.
+    """
+    col_grid, row_grid = warped_indices.read(window=window)
+    result = np.zeros(col_grid.shape, dtype=np.uint64)
+    positions = np.flatnonzero(col_grid >= 0)
+    if positions.size == 0:
+        return result
+    source_cols = col_grid.ravel()[positions]
+    source_rows = row_grid.ravel()[positions]
+    tiles_across = math.ceil(population.width / RASTER_BLOCK_SIZE)
+    tile_ids = (
+        source_rows.astype(np.int64) // RASTER_BLOCK_SIZE
+    ) * tiles_across + source_cols // RASTER_BLOCK_SIZE
+    order = np.argsort(tile_ids)
+    boundaries = np.flatnonzero(np.diff(tile_ids[order])) + 1
+    mask_flags = population.mask_flag_enums[0]
+    has_explicit_mask = (
+        MaskFlags.all_valid not in mask_flags and MaskFlags.nodata not in mask_flags
+    )
+    for group in np.split(order, boundaries):
+        cols, rows = source_cols[group], source_rows[group]
+        left, top = int(cols.min()), int(rows.min())
+        region = Window(
+            left, top, int(cols.max()) - left + 1, int(rows.max()) - top + 1
+        )
+        values = population.read(1, window=region)
+        if has_explicit_mask:
+            values[population.read_masks(1, window=region) == 0] = 0
+        result.flat[positions[group]] = values[rows - top, cols - left]
+    return result
+
+
+@contextlib.contextmanager
+def _open_population_window_reader(
+    population: rasterio.io.DatasetReader,
+    coverage: rasterio.io.DatasetReader,
+) -> Iterator[tuple[Callable[[Window], np.ndarray], int | float | None]]:
+    """Open a nearest-neighbor reader for population values on the coverage grid.
+
+    Args:
+        population: Open population source, including its validity metadata.
+        coverage: Open raster defining the destination grid.
+
+    Yields:
+        A window reader and the source's declared NoData value. UInt64 samples
+        and their NoData marker retain all bits until the scalar sum is computed.
+
+    Raises:
+        rasterio.errors.RasterioError: If the warped raster cannot be opened.
+    """
+    grid = dict(
+        crs=coverage.crs,
+        transform=coverage.transform,
+        width=coverage.width,
+        height=coverage.height,
+        resampling=Resampling.nearest,
+        # Supplying a source NoData value overrides its explicit validity mask.
+        src_nodata=None,
+        nodata=POPULATION_COMBINE_VRT_NODATA,
+    )
+    if population.dtypes[0] == "uint64":
+        index_xml, nodata = _build_population_index_vrt(population)
+        with rasterio.open(index_xml) as indices, WarpedVRT(indices, **grid) as warped:
+            yield partial(_read_uint64_population_window, population, warped), nodata
+        return
+    with WarpedVRT(population, **grid) as warped:
+        yield lambda window: warped.read(1, window=window), population.nodata
+
+
 def mask_population_with_coverage(
     population_raster_path: str | os.PathLike[str],
     coverage_raster_path: str | os.PathLike[str],
@@ -2642,7 +2788,8 @@ def mask_population_with_coverage(
 
     Population is sampled by nearest neighbor on the coverage grid. Cells excluded
     by the source mask or declared NoData, nonfinite or nonpositive values, and
-    uncovered cells are written as zero, the output NoData value.
+    uncovered cells are written as zero, the output NoData value. UInt64 pixels
+    retain their full precision. The returned total uses float64 arithmetic.
 
     Args:
         population_raster_path: Path-like global population raster to mask.
@@ -2674,30 +2821,25 @@ def mask_population_with_coverage(
             )
             _set_tiled_geotiff_creation_options(target_profile)
 
-            source_nodata = population.nodata
             population_sum = np.float64(0)
-            with WarpedVRT(
-                population,
-                crs=coverage.crs,
-                transform=coverage.transform,
-                width=coverage.width,
-                height=coverage.height,
-                resampling=Resampling.nearest,
-                # Let GDAL warp the source mask. Supplying a source NoData value
-                # overrides that mask, so exclude the sentinel after nearest sampling.
-                src_nodata=None,
-                nodata=POPULATION_COMBINE_VRT_NODATA,
-            ) as population_vrt:
+            with _open_population_window_reader(population, coverage) as (
+                read_population,
+                source_nodata,
+            ):
                 with rasterio.open(
                     target_population_raster_path, "w", **target_profile
                 ) as target:
+                    # Bound the UInt64 index arrays even when coverage uses wide strips.
+                    window_grid = (
+                        target if population.dtypes[0] == "uint64" else coverage
+                    )
                     for _, window in tqdm(
-                        coverage.block_windows(1),
+                        window_grid.block_windows(1),
                         desc=f"mask population {Path(coverage_raster_path).stem}",
                         unit="block",
                     ):
                         coverage_block = coverage.read(1, window=window)
-                        population_block = population_vrt.read(1, window=window)
+                        population_block = read_population(window)
                         covered_positive = (
                             (coverage_block > 0)
                             & (population_block > 0)
