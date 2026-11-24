@@ -469,7 +469,7 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
         self.assertEqual(result[1, 1], 1)
 
     def test_mask_population_with_coverage_applies_coverage_once(self) -> None:
-        """Count covered positive values that pass the source mask and NoData rules."""
+        """Check the masked raster and total for covered, finite positive values."""
         transform = from_origin(0, 2, 1, 1)
         coverage_profile = {
             "driver": "GTiff",
@@ -500,8 +500,10 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
                 ("uint32", 99, [4294967295, 99], [4294967295, 0], None),
                 ("float32", -9999, [97, 97], [0, 97], [0, 255]),
                 ("float32", 83, [97, 83], [0, 0], [0, 255]),
+                ("float32", -9999, [3, np.inf], [3, 0], None),
+                ("float32", -9999, [-np.inf, np.nan], [0, 0], None),
             ):
-                with self.subTest(dtype=dtype, nodata=nodata):
+                with self.subTest(dtype=dtype, nodata=nodata, values=first_column):
                     profile = dict(
                         coverage_profile, width=2, dtype=dtype, nodata=nodata
                     )

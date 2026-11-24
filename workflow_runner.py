@@ -2638,11 +2638,11 @@ def mask_population_with_coverage(
     coverage_raster_path: str | os.PathLike[str],
     target_population_raster_path: str | os.PathLike[str],
 ) -> float:
-    """Write positive population values on the coverage grid and return their sum.
+    """Write finite positive values on the coverage grid and return their sum.
 
     Population is sampled by nearest neighbor on the coverage grid. Cells excluded
-    by the source mask or declared NoData, nonpositive values, and uncovered
-    cells are written as zero, the output NoData value.
+    by the source mask or declared NoData, nonfinite or nonpositive values, and
+    uncovered cells are written as zero, the output NoData value.
 
     Args:
         population_raster_path: Path-like global population raster to mask.
@@ -2698,7 +2698,11 @@ def mask_population_with_coverage(
                     ):
                         coverage_block = coverage.read(1, window=window)
                         population_block = population_vrt.read(1, window=window)
-                        covered_positive = (coverage_block > 0) & (population_block > 0)
+                        covered_positive = (
+                            (coverage_block > 0)
+                            & (population_block > 0)
+                            & np.isfinite(population_block)
+                        )
                         if source_nodata is not None:
                             covered_positive &= population_block != source_nodata
                         masked_population = np.where(
