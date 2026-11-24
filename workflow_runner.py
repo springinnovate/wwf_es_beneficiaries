@@ -72,6 +72,7 @@ DEFAULT_TRAVEL_TIME_TASKGRAPH_WORKERS = 4
 TRAVEL_TIME_MAX_DISTANCE_M_PER_HOUR = 104_000
 TRAVEL_TIME_MAX_WINDOW_BYTES = 2 * 1024**3
 POPULATION_COMBINE_VRT_NODATA = -1
+_INT64_POPULATION_DTYPES = ("int64", "uint64")
 DISTANCE_TRANSFORM_NODATA = -1
 DOWNSTREAM_COVERAGE_EPSILON = 100 * np.finfo(float).eps
 GTIFF_CREATION_OPTIONS = (
@@ -2645,18 +2646,18 @@ def _build_population_index_vrt(
     """Describe a virtual raster of source columns and rows and read the exact NoData tag.
 
     Args:
-        population: Open UInt64 population raster.
+        population: Open signed or unsigned 64-bit integer population raster.
 
     Returns:
         GDAL VRT XML with two Int32 bands on the population grid, and its
-        original UInt64 NoData value if declared. GDAL generates the column
+        original integer NoData value if declared. GDAL generates the column
         and row sequences on demand. Only the grid metadata is copied.
 
     Raises:
         rasterio.errors.RasterioError: If GDAL cannot copy the source metadata.
     """
     # Rasterio exposes numeric NoData through a double. A GDAL VRT copy
-    # serializes the full UInt64 tag, including values adjacent to the maximum.
+    # serializes the full signed or unsigned integer tag.
     with MemoryFile(ext=".vrt") as metadata:
         copy_raster(population, metadata.name, driver="VRT")
         original = ElementTree.fromstring(metadata.read())
@@ -2689,31 +2690,31 @@ def _build_population_index_vrt(
     )
 
 
-def _read_uint64_population_window(
+def _read_native_integer_population_window(
     population: rasterio.io.DatasetReader,
     warped_indices: WarpedVRT,
     window: Window,
 ) -> np.ndarray:
-    """Sample native UInt64 pixels nearest the coverage cell centers.
+    """Read 64-bit population integers nearest the coverage cell centers.
 
     The ordinary GDAL warp selects source pixel indices. Reading those pixels
     directly avoids converting their values to double. Grouping by source tile
     bounds each read even when neighboring output cells map far apart.
 
     Args:
-        population: Original UInt64 population raster with its validity metadata.
+        population: Original 64-bit integer raster with its validity metadata.
         warped_indices: Source column and row bands warped to the coverage grid.
         window: Integer pixel window on the coverage grid.
 
     Returns:
-        A UInt64 array with zero outside the source or its validity mask.
-        Numeric NoData is excluded by the caller using the exact integer tag.
+        An array in the source dtype with zero for missing or masked pixels.
+        The caller excludes numeric NoData using the exact integer tag.
 
     Raises:
         rasterio.errors.RasterioError: If a source or index window cannot be read.
     """
     col_grid, row_grid = warped_indices.read(window=window)
-    result = np.zeros(col_grid.shape, dtype=np.uint64)
+    result = np.zeros(col_grid.shape, dtype=population.dtypes[0])
     positions = np.flatnonzero(col_grid >= 0)
     if positions.size == 0:
         return result
@@ -2754,8 +2755,8 @@ def _open_population_window_reader(
         coverage: Open raster defining the destination grid.
 
     Yields:
-        A window reader and the source's declared NoData value. UInt64 samples
-        and their NoData marker retain all bits until the scalar sum is computed.
+        A window reader and the source's declared NoData value. Signed and
+        unsigned 64-bit pixels and their NoData tag retain their full precision.
 
     Raises:
         rasterio.errors.RasterioError: If the warped raster cannot be opened.
@@ -2770,10 +2771,13 @@ def _open_population_window_reader(
         src_nodata=None,
         nodata=POPULATION_COMBINE_VRT_NODATA,
     )
-    if population.dtypes[0] == "uint64":
+    if population.dtypes[0] in _INT64_POPULATION_DTYPES:
         index_xml, nodata = _build_population_index_vrt(population)
         with rasterio.open(index_xml) as indices, WarpedVRT(indices, **grid) as warped:
-            yield partial(_read_uint64_population_window, population, warped), nodata
+            yield (
+                partial(_read_native_integer_population_window, population, warped),
+                nodata,
+            )
         return
     with WarpedVRT(population, **grid) as warped:
         yield lambda window: warped.read(1, window=window), population.nodata
@@ -2788,8 +2792,9 @@ def mask_population_with_coverage(
 
     Population is sampled by nearest neighbor on the coverage grid. Cells excluded
     by the source mask or declared NoData, nonpositive values, and uncovered
-    cells are written as zero, the output NoData value. UInt64 raster pixels
-    retain their full precision. The returned total uses float64 arithmetic.
+    cells are written as zero, the output NoData value. Signed and unsigned
+    64-bit integers retain their full precision in the output raster. The
+    returned total uses float64 arithmetic.
 
     Args:
         population_raster_path: Path-like global population raster to mask.
@@ -2829,9 +2834,11 @@ def mask_population_with_coverage(
                 with rasterio.open(
                     target_population_raster_path, "w", **target_profile
                 ) as target:
-                    # Bound the UInt64 index arrays even when coverage uses wide strips.
+                    # Bound the index arrays even when coverage uses wide strips.
                     window_grid = (
-                        target if population.dtypes[0] == "uint64" else coverage
+                        target
+                        if population.dtypes[0] in _INT64_POPULATION_DTYPES
+                        else coverage
                     )
                     for _, window in tqdm(
                         window_grid.block_windows(1),

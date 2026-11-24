@@ -496,9 +496,13 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
                 )
             int32_nodata = 2**27
             int32_neighbors = [int32_nodata - 1, int32_nodata + 1]
+            int64_nodata = 2**54
+            int64_neighbors = [int64_nodata - 1, int64_nodata + 1]
             for dtype, nodata, first_column, expected_column, first_column_mask in (
                 ("int32", 0, [10, 30], [10, 30], None),
                 ("int32", int32_nodata, int32_neighbors, int32_neighbors, None),
+                ("int64", int64_nodata, int64_neighbors, int64_neighbors, None),
+                ("int64", int64_nodata, [-(2**63), int64_nodata], [0, 0], [255, 255]),
                 ("uint8", 0, [255, 0], [255, 0], None),
                 ("uint16", 61234, [61234, 65535], [0, 65535], None),
                 ("uint32", 99, [4294967295, 99], [4294967295, 0], None),
