@@ -2634,16 +2634,14 @@ def stitch_coverage_masks(
 
 
 def mask_population_with_coverage(
-    population_raster_path,
-    coverage_raster_path,
-    target_population_raster_path,
-):
-    """Mask global population values by a stitched coverage raster.
+    population_raster_path: str | os.PathLike[str],
+    coverage_raster_path: str | os.PathLike[str],
+    target_population_raster_path: str | os.PathLike[str],
+) -> float:
+    """Write positive population values on the coverage grid and return their sum.
 
-    The coverage raster defines the target grid for the output. Population is
-    read through a WarpedVRT on that grid, with nodata and negative values
-    treated as 0. Pixels where coverage is 0 are written as 0, and pixels where
-    coverage is positive retain their population value.
+    Population is sampled by nearest neighbor on the coverage grid. Missing,
+    nonpositive and uncovered cells are written as zero, the output NoData value.
 
     Args:
         population_raster_path: Path-like global population raster to mask.
@@ -2654,6 +2652,10 @@ def mask_population_with_coverage(
 
     Returns:
         Sum of the output masked population raster.
+
+    Raises:
+        OSError: If the output directory cannot be created.
+        rasterio.errors.RasterioError: If a raster cannot be read or written.
     """
     logger = logging.getLogger(__name__)
     target_population_raster_path = Path(target_population_raster_path)
@@ -2694,16 +2696,11 @@ def mask_population_with_coverage(
                     ):
                         coverage_block = coverage.read(1, window=window)
                         population_block = population_vrt.read(1, window=window)
-                        population_block = population_block.astype(
-                            target_profile["dtype"],
-                            copy=False,
-                        )
-                        population_block[population_block < 0] = 0
                         masked_population = np.where(
                             (coverage_block > 0) & (population_block > 0),
                             population_block,
                             0,
-                        )
+                        ).astype(target_profile["dtype"], copy=False)
                         population_sum += np.sum(
                             masked_population,
                             dtype=np.float64,

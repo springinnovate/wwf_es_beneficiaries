@@ -468,24 +468,20 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
         self.assertEqual(result[1, 2], 0)
         self.assertEqual(result[1, 1], 1)
 
-    def test_mask_population_with_coverage_applies_coverage_once(self):
+    def test_mask_population_with_coverage_applies_coverage_once(self) -> None:
+        """Count only positive covered values, including valid unsigned maxima."""
         transform = from_origin(0, 2, 1, 1)
         coverage_profile = {
             "driver": "GTiff",
             "height": 2,
-            "width": 2,
+            "width": 3,
             "count": 1,
             "dtype": "uint8",
             "crs": "EPSG:4326",
             "transform": transform,
             "nodata": 0,
         }
-        population_profile = {
-            **coverage_profile,
-            "dtype": "int32",
-        }
         workflow_runner._set_tiled_geotiff_creation_options(coverage_profile)
-        workflow_runner._set_tiled_geotiff_creation_options(population_profile)
 
         with tempfile.TemporaryDirectory() as workspace:
             workspace_path = Path(workspace)
@@ -494,29 +490,37 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
             target_path = workspace_path / "masked_population.tif"
             with rasterio.open(coverage_path, "w", **coverage_profile) as coverage:
                 coverage.write(
-                    np.array([[1, 0], [1, 0]], dtype=np.uint8),
+                    np.array([[1, 0, 1], [1, 0, 1]], dtype=np.uint8),
                     1,
                 )
-            with rasterio.open(population_path, "w", **population_profile) as pop:
-                pop.write(
-                    np.array([[10, 20], [30, 40]], dtype=np.int32),
-                    1,
-                )
+            for dtype, nodata, first_column, expected_column in (
+                ("int32", 0, [10, 30], [10, 30]),
+                ("uint8", 0, [255, 0], [255, 0]),
+                ("uint16", 61234, [61234, 65535], [0, 65535]),
+                ("uint32", 99, [4294967295, 99], [4294967295, 0]),
+            ):
+                with self.subTest(dtype=dtype):
+                    profile = dict(
+                        coverage_profile, width=2, dtype=dtype, nodata=nodata
+                    )
+                    values = np.column_stack((first_column, [20, 40])).astype(dtype)
+                    expected = np.zeros((2, 3), dtype=dtype)
+                    expected[:, 0] = expected_column
+                    with rasterio.open(population_path, "w", **profile) as population:
+                        population.write(values, 1)
 
-            population_sum = workflow_runner.mask_population_with_coverage(
-                population_path,
-                coverage_path,
-                target_path,
-            )
-
-            with rasterio.open(target_path) as masked_population:
-                result = masked_population.read(1)
-
-        np.testing.assert_array_equal(
-            result,
-            np.array([[10, 0], [30, 0]], dtype=np.int32),
-        )
-        self.assertEqual(population_sum, 40)
+                    masked_sum = workflow_runner.mask_population_with_coverage(
+                        population_path, coverage_path, target_path
+                    )
+                    with rasterio.open(target_path) as masked:
+                        self.assertEqual(masked.dtypes, (dtype,))
+                        self.assertEqual(masked.nodata, 0)
+                        self.assertEqual(masked.transform, transform)
+                        np.testing.assert_array_equal(masked.read(1), expected)
+                        np.testing.assert_array_equal(
+                            masked.read_masks(1) > 0, expected > 0
+                        )
+                    self.assertEqual(masked_sum, sum(expected_column))
 
     def test_full_extent_includes_travel_time_condition_rasters(self):
         raster_paths = workflow_runner._raster_paths_for_full_extent(
