@@ -469,7 +469,7 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
         self.assertEqual(result[1, 1], 1)
 
     def test_mask_population_with_coverage_applies_coverage_once(self) -> None:
-        """Count only positive covered values, including valid unsigned maxima."""
+        """Count covered positive values that pass the source mask and NoData rules."""
         transform = from_origin(0, 2, 1, 1)
         coverage_profile = {
             "driver": "GTiff",
@@ -493,21 +493,30 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
                     np.array([[1, 0, 1], [1, 0, 1]], dtype=np.uint8),
                     1,
                 )
-            for dtype, nodata, first_column, expected_column in (
-                ("int32", 0, [10, 30], [10, 30]),
-                ("uint8", 0, [255, 0], [255, 0]),
-                ("uint16", 61234, [61234, 65535], [0, 65535]),
-                ("uint32", 99, [4294967295, 99], [4294967295, 0]),
+            for dtype, nodata, first_column, expected_column, first_column_mask in (
+                ("int32", 0, [10, 30], [10, 30], None),
+                ("uint8", 0, [255, 0], [255, 0], None),
+                ("uint16", 61234, [61234, 65535], [0, 65535], None),
+                ("uint32", 99, [4294967295, 99], [4294967295, 0], None),
+                ("float32", -9999, [97, 97], [0, 97], [0, 255]),
+                ("float32", 83, [97, 83], [0, 0], [0, 255]),
             ):
-                with self.subTest(dtype=dtype):
+                with self.subTest(dtype=dtype, nodata=nodata):
                     profile = dict(
                         coverage_profile, width=2, dtype=dtype, nodata=nodata
                     )
                     values = np.column_stack((first_column, [20, 40])).astype(dtype)
                     expected = np.zeros((2, 3), dtype=dtype)
                     expected[:, 0] = expected_column
-                    with rasterio.open(population_path, "w", **profile) as population:
+                    with (
+                        rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True),
+                        rasterio.open(population_path, "w", **profile) as population,
+                    ):
                         population.write(values, 1)
+                        if first_column_mask is not None:
+                            validity = np.full(values.shape, 255, dtype="uint8")
+                            validity[:, 0] = first_column_mask
+                            population.write_mask(validity)
 
                     masked_sum = workflow_runner.mask_population_with_coverage(
                         population_path, coverage_path, target_path
