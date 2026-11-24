@@ -2634,16 +2634,15 @@ def stitch_coverage_masks(
 
 
 def mask_population_with_coverage(
-    population_raster_path,
-    coverage_raster_path,
-    target_population_raster_path,
-):
-    """Mask global population values by a stitched coverage raster.
+    population_raster_path: str | os.PathLike[str],
+    coverage_raster_path: str | os.PathLike[str],
+    target_population_raster_path: str | os.PathLike[str],
+) -> float:
+    """Write positive population values on the coverage grid and return their sum.
 
-    The coverage raster defines the target grid for the output. Population is
-    read through a WarpedVRT on that grid, with nodata and negative values
-    treated as 0. Pixels where coverage is 0 are written as 0, and pixels where
-    coverage is positive retain their population value.
+    Population is sampled by nearest neighbor on the coverage grid. Cells excluded
+    by the source mask or declared NoData, nonpositive values, and uncovered
+    cells are written as zero, the output NoData value.
 
     Args:
         population_raster_path: Path-like global population raster to mask.
@@ -2654,6 +2653,10 @@ def mask_population_with_coverage(
 
     Returns:
         Sum of the output masked population raster.
+
+    Raises:
+        OSError: If the output directory cannot be created.
+        rasterio.errors.RasterioError: If a raster cannot be read or written.
     """
     logger = logging.getLogger(__name__)
     target_population_raster_path = Path(target_population_raster_path)
@@ -2671,19 +2674,20 @@ def mask_population_with_coverage(
             )
             _set_tiled_geotiff_creation_options(target_profile)
 
-            vrt_kwargs = {
-                "crs": coverage.crs,
-                "transform": coverage.transform,
-                "width": coverage.width,
-                "height": coverage.height,
-                "resampling": Resampling.nearest,
-                "nodata": POPULATION_COMBINE_VRT_NODATA,
-            }
-            if population.nodata is not None:
-                vrt_kwargs["src_nodata"] = population.nodata
-
+            source_nodata = population.nodata
             population_sum = np.float64(0)
-            with WarpedVRT(population, **vrt_kwargs) as population_vrt:
+            with WarpedVRT(
+                population,
+                crs=coverage.crs,
+                transform=coverage.transform,
+                width=coverage.width,
+                height=coverage.height,
+                resampling=Resampling.nearest,
+                # Let GDAL warp the source mask. Supplying a source NoData value
+                # overrides that mask, so exclude the sentinel after nearest sampling.
+                src_nodata=None,
+                nodata=POPULATION_COMBINE_VRT_NODATA,
+            ) as population_vrt:
                 with rasterio.open(
                     target_population_raster_path, "w", **target_profile
                 ) as target:
@@ -2694,16 +2698,14 @@ def mask_population_with_coverage(
                     ):
                         coverage_block = coverage.read(1, window=window)
                         population_block = population_vrt.read(1, window=window)
-                        population_block = population_block.astype(
-                            target_profile["dtype"],
-                            copy=False,
-                        )
-                        population_block[population_block < 0] = 0
+                        covered_positive = (coverage_block > 0) & (population_block > 0)
+                        if source_nodata is not None:
+                            covered_positive &= population_block != source_nodata
                         masked_population = np.where(
-                            (coverage_block > 0) & (population_block > 0),
+                            covered_positive,
                             population_block,
                             0,
-                        )
+                        ).astype(target_profile["dtype"], copy=False)
                         population_sum += np.sum(
                             masked_population,
                             dtype=np.float64,
