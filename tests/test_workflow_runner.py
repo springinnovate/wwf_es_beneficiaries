@@ -7,6 +7,7 @@ import tempfile
 import geopandas as gpd
 import numpy as np
 import rasterio
+from osgeo import gdal
 from pyproj import CRS, Transformer
 from rasterio.transform import from_origin
 from rasterio.windows import from_bounds
@@ -498,6 +499,9 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
                 ("uint8", 0, [255, 0], [255, 0], None),
                 ("uint16", 61234, [61234, 65535], [0, 65535], None),
                 ("uint32", 99, [4294967295, 99], [4294967295, 0], None),
+                ("uint64", None, [2**64 - 1, 7], [2**64 - 1, 7], None),
+                ("uint64", None, [2**53 + 1, 2**63 + 3], [2**53 + 1, 2**63 + 3], None),
+                ("uint64", 29, [2**64 - 2, 29], [0, 0], [0, 255]),
                 ("float32", -9999, [97, 97], [0, 97], [0, 255]),
                 ("float32", 83, [97, 83], [0, 0], [0, 255]),
             ):
@@ -505,7 +509,9 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
                     profile = dict(
                         coverage_profile, width=2, dtype=dtype, nodata=nodata
                     )
-                    values = np.column_stack((first_column, [20, 40])).astype(dtype)
+                    values = np.empty((2, 2), dtype=dtype)
+                    values[:, 0] = first_column
+                    values[:, 1] = [20, 40]
                     expected = np.zeros((2, 3), dtype=dtype)
                     expected[:, 0] = expected_column
                     with (
@@ -529,7 +535,70 @@ class Wgs84BoundsMaskTests(unittest.TestCase):
                         np.testing.assert_array_equal(
                             masked.read_masks(1) > 0, expected > 0
                         )
-                    self.assertEqual(masked_sum, sum(expected_column))
+                    self.assertEqual(masked_sum, float(sum(expected_column)))
+
+    def test_uint64_population_on_a_projected_grid(self) -> None:
+        """Sample across source tiles and distinguish an exact NoData tag from its neighbor."""
+        maximum = 2**64 - 1
+        nodata = maximum - 1
+        values = np.zeros((1, 1024), dtype="uint64")
+        values[0, [127, 383, 639, 895]] = [maximum, nodata, 2**63 + 5, 2**53 + 1]
+        validity = np.full(values.shape, 255, dtype="uint8")
+        validity[0, 639] = 0
+        # Each degree of longitude spans 256 source cells, offset by a quarter cell.
+        to_metres = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+        degree_width, degree_height = to_metres.transform(1, 1)
+        cell_width = degree_width / 256
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "values.tif"
+            coverage = root / "coverage.tif"
+            output = root / "output.tif"
+            with (
+                rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True),
+                rasterio.open(
+                    source,
+                    "w",
+                    driver="GTiff",
+                    count=1,
+                    height=1,
+                    width=1024,
+                    crs="EPSG:3857",
+                    dtype="uint64",
+                    transform=from_origin(
+                        cell_width / 4, degree_height, cell_width, degree_height
+                    ),
+                    tiled=True,
+                    blockxsize=256,
+                    blockysize=256,
+                ) as population,
+            ):
+                population.write(values, 1)
+                population.write_mask(validity)
+            with gdal.Open(str(source), gdal.GA_Update) as dataset:
+                dataset.GetRasterBand(1).SetNoDataValueAsUInt64(nodata)
+            with rasterio.open(
+                coverage,
+                "w",
+                driver="GTiff",
+                count=1,
+                height=1,
+                width=5,
+                crs="EPSG:4326",
+                dtype="uint8",
+                transform=from_origin(0, 1, 1, 1),
+            ) as covered:
+                covered.write(np.ones((1, 5), dtype="uint8"), 1)
+
+            total = workflow_runner.mask_population_with_coverage(
+                source, coverage, output
+            )
+            expected = np.array([[maximum, 0, 0, 2**53 + 1, 0]], dtype="uint64")
+            with rasterio.open(output) as masked:
+                np.testing.assert_array_equal(masked.read(1), expected)
+                np.testing.assert_array_equal(masked.read_masks(1) > 0, expected > 0)
+                self.assertEqual(masked.transform, from_origin(0, 1, 1, 1))
+            self.assertEqual(total, float(maximum + 2**53 + 1))
 
     def test_full_extent_includes_travel_time_condition_rasters(self):
         raster_paths = workflow_runner._raster_paths_for_full_extent(
