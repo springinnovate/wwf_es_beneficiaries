@@ -132,7 +132,7 @@ Important `inputs` keys:
 
 | Key | Purpose |
 | --- | --- |
-| `population_raster_path` | Raster whose positive values are counted as beneficiaries. |
+| `population_raster_path` | Raster whose finite positive values are counted as beneficiaries. |
 | `traveltime_raster_path` | Friction or travel-time raster used by travel-time masks. |
 | `dem_raster_path` | DEM used to derive multiple-flow-direction routing. |
 | `subwatershed_vector_path` | HydroBASINS-style vector used to partition downstream work. |

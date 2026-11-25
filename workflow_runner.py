@@ -2788,7 +2788,7 @@ def mask_population_with_coverage(
     coverage_raster_path: str | os.PathLike[str],
     target_population_raster_path: str | os.PathLike[str],
 ) -> float:
-    """Write positive population values on the coverage grid and return their sum.
+    """Write finite positive values on the coverage grid and return their sum.
 
     Population is sampled by nearest neighbor on the coverage grid. Cells excluded
     by the source mask or declared NoData, nonpositive values, and uncovered
@@ -2804,7 +2804,8 @@ def mask_population_with_coverage(
             population values will be written.
 
     Returns:
-        Sum of the output masked population raster.
+        Sum of the output masked population raster. Nonfinite samples are
+        written as zero (NoData) and contribute nothing to this total.
 
     Raises:
         OSError: If the output directory cannot be created.
@@ -2847,7 +2848,11 @@ def mask_population_with_coverage(
                     ):
                         coverage_block = coverage.read(1, window=window)
                         population_block = read_population(window)
-                        covered_positive = (coverage_block > 0) & (population_block > 0)
+                        covered_positive = (
+                            (coverage_block > 0)
+                            & (population_block > 0)
+                            & np.isfinite(population_block)
+                        )
                         if source_nodata is not None:
                             covered_positive &= population_block != source_nodata
                         masked_population = np.where(
